@@ -4,6 +4,8 @@ BCSAI — Machine Learning Foundations | Group project
 
 **Status:** Approved by Prof. Matteo Turilli
 
+**Group repository:** [github.com/Kiril-P/Final-Group-Project-Machine-Learning](https://github.com/Kiril-P/Final-Group-Project-Machine-Learning)
+
 Unsupervised anomaly detection on aggregated player behavior (Lichess-style games), framed as **detectable deviations** from rating-group norms — not definitive “smurfing” labels.
 
 ---

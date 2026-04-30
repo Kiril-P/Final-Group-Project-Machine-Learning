@@ -1,0 +1,16 @@
+# Optional: Conda / Mamba instead of venv + scripts/setup.sh
+#
+#   conda env create -f environment.yml
+#   conda activate chess-anomaly
+#   python scripts/download_kaggle_dataset.py
+#
+# Then use the same Kaggle / manual data steps as in README.md
+
+name: chess-anomaly
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - -r requirements.txt

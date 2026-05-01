@@ -10,7 +10,11 @@ import json
 import logging
 from pathlib import Path
 
-from src.config import RESULTS_DIR
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+
+from src.config import RANDOM_SEED, RESULTS_DIR
 from src.data_loader import load_and_prepare
 from src.features import aggregate_player_stats, add_engineered_features, get_feature_matrix
 from src.interpretation import (
@@ -19,7 +23,15 @@ from src.interpretation import (
     plot_anomaly_score_distribution,
     plot_feature_importance,
 )
-from src.models import IsolationForestDetector, run_all_models
+from src.models import (
+    AutoencoderDetector,
+    IsolationForestDetector,
+    LOFDetector,
+    OneClassSVMDetector,
+    ZScoreBaseline,
+    run_all_models,
+    tune_contamination,
+)
 from src.validation import (
     compute_davies_bouldin,
     compute_silhouette,
@@ -64,42 +76,85 @@ def main(use_acpl: bool = False, time_control: str = "blitz"):
     agg.to_csv(RESULTS_DIR / "player_features.csv", index=False)
     logger.info("Saved player features to %s", RESULTS_DIR / "player_features.csv")
 
-    logger.info("Stage 3: Training anomaly detection models...")
-    results = run_all_models(X_arr, meta)
+    logger.info("Stage 2a: Train/holdout split (80/20)...")
+    train_idx, test_idx = train_test_split(
+        np.arange(len(X_arr)), test_size=0.2, random_state=RANDOM_SEED
+    )
+    X_train, X_test = X_arr[train_idx], X_arr[test_idx]
+    meta_train = meta.iloc[train_idx].reset_index(drop=True)
+    meta_test = meta.iloc[test_idx].reset_index(drop=True)
+    logger.info("Train: %s players, Holdout: %s players", len(X_train), len(X_test))
+
+    logger.info("Stage 2b: Hyperparameter tuning on train split (subtle injection)...")
+    X_inj_tune, y_inj_tune = inject_synthetic_anomalies(
+        pd.DataFrame(X_train, columns=feature_names), n=50, strategy="subtle"
+    )
+    X_inj_arr = X_inj_tune.values if hasattr(X_inj_tune, "values") else X_inj_tune
+    tuning_df = tune_contamination(X_train, X_inj_arr, y_inj_tune)
+    tuning_df.to_csv(RESULTS_DIR / "hyperparameter_tuning.csv", index=False)
+    best = tuning_df.loc[tuning_df.groupby("model")["roc_auc"].idxmax()]
+    overrides = dict(zip(best["model"], best["contamination"]))
+    logger.info("Best contamination per model: %s", overrides)
+
+    logger.info("Stage 3: Training anomaly detection models on train split...")
+    results = run_all_models(X_train, meta_train, contamination_overrides=overrides)
     results.to_csv(RESULTS_DIR / "model_results.csv", index=False)
     logger.info("Saved model results to %s", RESULTS_DIR / "model_results.csv")
 
-    logger.info("Stage 4: Synthetic anomaly injection...")
-    if_model = IsolationForestDetector()
-    if_model.fit(X_arr)
-    X_inj, y_inj = inject_synthetic_anomalies(X, n=50, strategy="engine_perfect")
+    logger.info("Stage 4: Holdout evaluation — injection recovery on unseen data...")
+    if_model = IsolationForestDetector(contamination=overrides.get("IsolationForest", 0.05))
+    if_model.fit(X_train)
+
+    holdout_rows = []
+    for strategy in ("engine_perfect", "subtle"):
+        X_inj_eval, y_inj_eval = inject_synthetic_anomalies(
+            pd.DataFrame(X_test, columns=feature_names), n=50, strategy=strategy
+        )
+        for ctor, name in [
+            (lambda: ZScoreBaseline(contamination=0.05), "ZScoreBaseline"),
+            (lambda: LOFDetector(contamination=overrides.get("LOF", 0.05)), "LOF"),
+            (lambda: IsolationForestDetector(contamination=overrides.get("IsolationForest", 0.05)), "IsolationForest"),
+            (lambda: OneClassSVMDetector(nu=overrides.get("OneClassSVM", 0.05)), "OneClassSVM"),
+            (lambda: AutoencoderDetector(input_dim=X_train.shape[1]), "Autoencoder"),
+        ]:
+            m = ctor()
+            m.fit(X_train)
+            metrics = evaluate_injection_recovery(m, X_inj_eval, y_inj_eval)
+            holdout_rows.append({"model": name, "strategy": strategy, **metrics})
+    holdout_df = pd.DataFrame(holdout_rows)
+    holdout_df.to_csv(RESULTS_DIR / "holdout_evaluation.csv", index=False)
+    logger.info("Holdout evaluation saved.\n%s", holdout_df.to_string(index=False))
+
+    # Keep a reference single-strategy injection result for back-compat with notebook
+    X_inj, y_inj = inject_synthetic_anomalies(
+        pd.DataFrame(X_test, columns=feature_names), n=50, strategy="subtle"
+    )
     injection_results = evaluate_injection_recovery(if_model, X_inj, y_inj)
     Path(RESULTS_DIR / "injection_results.json").write_text(json.dumps(injection_results, indent=2))
-    logger.info("Injection results saved.")
 
-    logger.info("Stage 5: Statistical tests...")
-    if_labels = if_model.predict(X_arr)
+    logger.info("Stage 5: Statistical tests (on train split)...")
+    if_labels = if_model.predict(X_train)
     divergence_df = test_anomaly_vs_normal(
-        anomaly_scores=if_model.score(X_arr),
+        anomaly_scores=if_model.score(X_train),
         labels=if_labels,
-        feature_matrix=X_arr,
+        feature_matrix=X_train,
         feature_names=feature_names,
     )
     divergence_df.to_csv(RESULTS_DIR / "statistical_tests.csv", index=False)
 
-    sil = compute_silhouette(X_arr, if_labels)
-    db = compute_davies_bouldin(X_arr, if_labels)
+    sil = compute_silhouette(X_train, if_labels)
+    db = compute_davies_bouldin(X_train, if_labels)
     logger.info("Silhouette: %s, Davies-Bouldin: %s", sil, db)
 
     logger.info("Stage 6: Feature importance...")
-    importance_df = permutation_feature_importance(if_model, X_arr, feature_names)
+    importance_df = permutation_feature_importance(if_model, X_train, feature_names)
     importance_df.to_csv(RESULTS_DIR / "feature_importance.csv", index=False)
     plot_feature_importance(importance_df)
 
-    plot_anomaly_score_distribution(if_model.score(X_arr), if_labels, "IsolationForest")
+    plot_anomaly_score_distribution(if_model.score(X_train), if_labels, "IsolationForest")
 
     logger.info("Stage 7: Failure mode analysis...")
-    failure_df = analyze_false_positives(meta, results, player_df)
+    failure_df = analyze_false_positives(meta_train, results, player_df)
     failure_df.to_csv(RESULTS_DIR / "failure_analysis.csv", index=False)
 
     logger.info("Pipeline complete. Outputs in %s", RESULTS_DIR)

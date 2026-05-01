@@ -38,6 +38,17 @@ def inject_synthetic_anomalies(
         synthetic += rng.normal(0, 0.05, synthetic.shape)
     elif strategy == "extreme_outlier":
         synthetic = rng.normal(3.5, 0.5, (n, X_arr.shape[1]))
+    elif strategy == "subtle":
+        # Smurf-like: take real player rows, perturb a couple of features by ~1.5 sd.
+        # Anomalies stay close to the data manifold and are genuinely hard to separate.
+        idx = rng.choice(len(X_arr), size=n, replace=True)
+        synthetic = X_arr[idx].copy()
+        n_features = X_arr.shape[1]
+        n_perturb = max(1, n_features // 3)
+        sds = X_arr.std(axis=0)
+        for i in range(n):
+            feats = rng.choice(n_features, size=n_perturb, replace=False)
+            synthetic[i, feats] += rng.normal(0, 1.5, n_perturb) * sds[feats]
     else:
         raise ValueError(f"Unknown strategy: {strategy}")
 

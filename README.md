@@ -1,196 +1,199 @@
 # Unmasking the Board: Behavioral Anomaly Detection in Human Chess
 
-BCSAI — Machine Learning Foundations | Group project
+BCSAI - Machine Learning Foundations | Group project
 
-**Status:** Approved by Prof. Matteo Turilli
+Status: Approved by Prof. Matteo Turilli
 
-**Group repository:** [github.com/Kiril-P/Final-Group-Project-Machine-Learning](https://github.com/Kiril-P/Final-Group-Project-Machine-Learning)
+Group repository: [github.com/Kiril-P/Final-Group-Project-Machine-Learning](https://github.com/Kiril-P/Final-Group-Project-Machine-Learning)
 
-Unsupervised anomaly detection on aggregated player behavior (Lichess-style games), framed as **detectable deviations** from rating-group norms — not definitive “smurfing” labels.
+This project detects unusual player behavior patterns in online chess games using unsupervised anomaly detection. The workflow starts from game-level Lichess data, reshapes it into player-level records, engineers behavioral features, and then compares multiple detectors (Isolation Forest, One-Class SVM, Local Outlier Factor, and an autoencoder) against synthetic anomaly injections. The objective is to identify statistically unusual behavior clusters for analysis, not to assign definitive cheating labels.
 
----
+## What The Pipeline Does
+
+Running the full pipeline with `python -m src.pipeline` executes these stages:
+
+1. Load and clean raw game data from `data/raw/games.csv`.
+2. Build player-level aggregates and engineered features.
+3. Split data into train/validation/test (70/15/15) and fit scaling on train only.
+4. Tune model hyperparameters on injected validation anomalies.
+5. Run 5-fold cross-validation on the development split.
+6. Train all models and evaluate on validation and holdout test injections.
+7. Export metrics, feature importance, and failure analysis outputs.
+
+Main outputs are written to `results/` (metrics and analysis tables) and `models/` (saved fitted models).
 
 ## Prerequisites
 
-- **Python 3.10+** (3.12 recommended; matches course tooling).
-- **Disk space** for the Kaggle sample (~3 MB) and generated figures.
+- Python 3.10+ (3.12 recommended).
 
----
+## Setup And Run
 
-## First-time setup (recommended)
+Use one of the two workflows below.
 
-Pick **one** of the following; each creates a **`.venv`** in the project root, installs everything from `requirements.txt`, and tries to download **`data/raw/games.csv`** when Kaggle is configured (otherwise it prints skip instructions and continues).
+### macOS/Linux
 
-### macOS / Linux
+1. Go to the project root.
 
-```bash
-cd "/path/to/Behavioral Anomaly Detection in Human Chess"
+~~~bash
+cd "/path/to/Final-Group-Project-Machine-Learning"
+~~~
+
+2. Create the environment, install dependencies, and attempt dataset download.
+
+~~~bash
 bash scripts/setup.sh
+~~~
+
+3. Activate the environment.
+
+~~~bash
 source .venv/bin/activate
-```
+~~~
 
-Optional environment variables:
+4. Run tests.
 
-| Variable | Effect |
-|----------|--------|
-| `PYTHON=/path/to/python3.12` | Use a specific interpreter to create `.venv`. |
-| `SKIP_DATA_DOWNLOAD=1` | Do not run the Kaggle step. |
-| `INSTALL_JUPYTER_KERNEL=1` | Register a Jupyter kernel named `chess-anomaly` for this venv. |
+~~~bash
+python -m pytest
+~~~
+
+5. Verify the dataset is readable.
+
+~~~bash
+python -c "from src.data_loader import load_raw; print(load_raw().shape)"
+~~~
+
+6. Run the full pipeline.
+
+~~~bash
+python -m src.pipeline
+~~~
 
 ### Windows (PowerShell)
 
-```powershell
-cd "C:\path\to\Behavioral Anomaly Detection in Human Chess"
+1. Go to the project root.
+
+~~~powershell
+cd "C:\path\to\Final-Group-Project-Machine-Learning"
+~~~
+
+2. Create the environment, install dependencies, and attempt dataset download.
+
+~~~powershell
 powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
-.\.venv\Scripts\Activate.ps1
-```
+~~~
 
-Same optional variables: `PYTHON`, `SKIP_DATA_DOWNLOAD`, `INSTALL_JUPYTER_KERNEL`.
+3. Activate the environment.
 
-### Conda / Mamba (optional)
+~~~powershell
+& .\.venv\Scripts\Activate.ps1
+~~~
 
-If your team prefers Conda instead of `.venv`:
+4. Run tests.
 
-```bash
-conda env create -f environment.yml
-conda activate chess-anomaly
-python scripts/download_kaggle_dataset.py
-```
-
-The `pip:` section installs the same packages as `requirements.txt`.
-
-### Make (macOS / Linux)
-
-```bash
-make setup      # .venv + pip install + dataset download (same as setup.sh)
-make test       # pytest (uses .venv when present)
-make lab        # Jupyter Lab → 01_eda.ipynb
-```
-
-Run `make help` for all targets.
-
----
-
-## Manual setup (if you prefer not to use the scripts)
-
-```bash
-cd "/path/to/Behavioral Anomaly Detection in Human Chess"
-python3 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-python -m pip install -U pip setuptools wheel
-pip install -r requirements.txt
-python scripts/download_kaggle_dataset.py
-```
-
-Always **activate `.venv`** before running notebooks, tests, or `python -m src.pipeline` so Jupyter and the shell use the same packages.
-
----
-
-## Data (`data/raw/games.csv`)
-
-The bootstrap scripts run **`scripts/download_kaggle_dataset.py`**, which:
-
-1. Prefers **`.venv/bin/kaggle`** (or **`.venv\Scripts\kaggle.exe`**) so it works right after `pip install` without relying on global PATH.
-2. Exits successfully with a **SKIP** message if the CLI or **`~/.kaggle/kaggle.json`** is missing (teammates without Kaggle are not blocked).
-
-To enable automatic download:
-
-1. [Kaggle → Settings → API](https://www.kaggle.com/settings) → create token.
-2. Place `kaggle.json` in **`~/.kaggle/`** and on macOS/Linux run: `chmod 600 ~/.kaggle/kaggle.json`.
-
-**Manual fallback:** download [Chess Game Dataset (Lichess)](https://www.kaggle.com/datasets/datasnaek/chess) and put **`games.csv`** in **`data/raw/`**.
-
----
-
-## Verify
-
-```bash
-source .venv/bin/activate
+~~~powershell
 python -m pytest
+~~~
+
+5. Verify the dataset is readable.
+
+~~~powershell
 python -c "from src.data_loader import load_raw; print(load_raw().shape)"
-```
+~~~
 
----
+6. Run the full pipeline.
 
-## Notebooks
-
-Use the activated **`.venv`** as the Jupyter kernel (or run `INSTALL_JUPYTER_KERNEL=1 bash scripts/setup.sh` once).
-
-```bash
-python -m jupyter lab notebooks/01_eda.ipynb
-```
-
-Notebooks add the repo root to `sys.path`, so they work whether the process cwd is the repo root or `notebooks/`.
-
----
-
-## Full pipeline (optional)
-
-```bash
+~~~powershell
 python -m src.pipeline
-```
+~~~
 
-Outputs under `results/` and `models/`.
+## Dataset
 
----
+The setup scripts above already call `scripts/download_kaggle_dataset.py`.
 
-## Optional: Stockfish (ACPL)
+- If Kaggle CLI and credentials are configured, `data/raw/games.csv` is downloaded automatically.
+- If Kaggle is not configured, the script prints a skip message and setup still completes.
 
-```bash
-brew install stockfish   # macOS
-export STOCKFISH_PATH=/opt/homebrew/bin/stockfish   # Apple Silicon example
-```
+Dataset source website: [Kaggle - Chess Game Dataset (Lichess)](https://www.kaggle.com/datasets/datasnaek/chess)
 
----
+Kaggle API credentials page: [Kaggle Settings](https://www.kaggle.com/settings)
 
-## Repository layout
+If download is skipped, manually place `games.csv` in `data/raw/`, then rerun:
 
-```
+~~~bash
+python -c "from src.data_loader import load_raw; print(load_raw().shape)"
+~~~
+
+## Daily Use (After First Setup)
+
+Use this when `.venv` and dependencies are already installed.
+
+### macOS/Linux
+
+1. Go to the project root and activate the environment.
+
+~~~bash
+cd "/path/to/Final-Group-Project-Machine-Learning"
+source .venv/bin/activate
+~~~
+
+2. Run the pipeline.
+
+~~~bash
+python -m src.pipeline
+~~~
+
+3. Optional checks.
+
+~~~bash
+python -m pytest
+python -m jupyter lab notebooks/01_eda.ipynb
+~~~
+
+### Windows (PowerShell)
+
+1. Go to the project root and activate the environment.
+
+~~~powershell
+cd "C:\path\to\Final-Group-Project-Machine-Learning"
+& .\.venv\Scripts\Activate.ps1
+~~~
+
+2. Run the pipeline.
+
+~~~powershell
+python -m src.pipeline
+~~~
+
+3. Optional checks.
+
+~~~powershell
+python -m pytest
+python -m jupyter lab notebooks/01_eda.ipynb
+~~~
+
+## Project Layout
+
+~~~text
 ├── data/
-│   ├── raw/              # games.csv (download; not committed)
-│   └── processed/        # Intermediate tables (optional)
-├── docs/                 # Proposal, feedback, course PDFs
-├── models/               # Saved artifacts (.pkl / .pt)
-├── notebooks/            # Jupyter entry points (run from repo root or notebooks/)
-├── results/              # Figures and CSV outputs from notebooks / pipeline
-├── scripts/              # setup.sh, setup.ps1, download_kaggle_dataset.py
-├── src/                  # Importable library (loaders, features, models, validation)
-├── tests/                # pytest
-├── Makefile              # make setup | test | lab | …
-├── environment.yml       # optional Conda/Mamba env (same deps as requirements.txt)
+│   ├── raw/              # games.csv (not committed)
+│   └── processed/        # optional intermediate artifacts
+├── docs/
+├── models/               # saved model files (.pkl, .pt)
+├── notebooks/            # EDA and modeling notebooks
+├── results/              # pipeline outputs, metrics, analysis tables
+├── scripts/              # setup and dataset bootstrap scripts
+├── src/                  # project code (loading, features, models, validation)
+├── tests/
+├── Makefile
+├── environment.yml
 ├── requirements.txt
 ├── pytest.ini
 └── README.md
-```
+~~~
 
-Course requirement: keep **heavy logic in `src/`** and use notebooks as a thin, top-to-bottom runnable interface.
-
----
-
-## Notebooks (planned)
+## Notebooks
 
 | Notebook | Purpose |
 |----------|---------|
-| `notebooks/01_eda.ipynb` | EDA, data quality, distributions |
-| `notebooks/03_modeling.ipynb` | Isolation Forest, OCSVM, autoencoder comparison |
-
-Add `02_feature_engineering`, `04_autoencoder`, `05_evaluation` as the project matures.
-
----
-
-## Team
-
-| Name | Role |
-|------|------|
-| Christoph | Lead |
-| … | … |
-
----
-
-## References
-
-- [Kaggle: Chess Game Dataset (Lichess)](https://www.kaggle.com/datasets/datasnaek/chess)
-- [Lichess open database](https://database.lichess.org/)
-- [scikit-learn](https://scikit-learn.org/)
-- [Stockfish](https://stockfishchess.org/)
-- [SHAP](https://shap.readthedocs.io/)
+| `notebooks/01_eda.ipynb` | Data inspection, quality checks, distributions |
+| `notebooks/03_modeling.ipynb` | Model comparison and anomaly detection analysis |

@@ -31,7 +31,7 @@ from src.models import (
     OneClassSVMDetector,
     ZScoreBaseline,
     run_all_models,
-    tune_contamination,
+    run_hyperparameter_search,
 )
 from src.validation import (
     compute_davies_bouldin,
@@ -104,36 +104,50 @@ def main(use_acpl: bool = False, time_control: str = "blitz"):
         len(X_train), len(X_val), len(X_test),
     )
 
-    # ── Stage 2c: Hyperparameter tuning on validation set ───────────────────
-    # Inject synthetic anomalies into the val set and search for the contamination
-    # rate that maximises ROC-AUC on that held-out partition.  The test set is
-    # never touched during tuning.
-    logger.info("Stage 2c: Hyperparameter tuning on val split (subtle injection)...")
+    # ── Stage 2c: Multi-parameter random search on the validation set ────────
+    # Synthetic anomalies are injected into the val split to create a labelled
+    # evaluation set.  Models are trained on X_train and scored on val+injected,
+    # so the test set is never seen during model selection.
+    #
+    # IF / OC-SVM / LOF: 20-iteration random search over contamination AND
+    #   structural params (n_estimators, n_neighbors, kernel, etc.).
+    # Autoencoder: exhaustive mini-grid over encoding_dim × threshold_percentile
+    #   using 30-epoch trials; best config re-trained at full epochs below.
+    logger.info("Stage 2c: Hyperparameter search on val split...")
     X_inj_tune, y_inj_tune = inject_synthetic_anomalies(
         pd.DataFrame(X_val, columns=feature_names), n=50, strategy="subtle"
     )
     X_inj_arr = X_inj_tune.values if hasattr(X_inj_tune, "values") else X_inj_tune
-    tuning_df = tune_contamination(X_train, X_inj_arr, y_inj_tune)
-    tuning_df.to_csv(RESULTS_DIR / "hyperparameter_tuning.csv", index=False)
-    best = tuning_df.loc[tuning_df.groupby("model")["roc_auc"].idxmax()]
-    overrides = dict(zip(best["model"], best["contamination"]))
-    logger.info("Best contamination per model: %s", overrides)
+
+    search_results, best_params = run_hyperparameter_search(
+        X_train=X_train,
+        X_val_injected=X_inj_arr,
+        y_val_injected=y_inj_tune,
+    )
+    search_results.to_csv(RESULTS_DIR / "hyperparameter_tuning.csv", index=False)
+    logger.info("Best params per model:\n%s", {k: v for k, v in best_params.items()})
 
     logger.info("Stage 3: Training anomaly detection models on train split...")
-    results = run_all_models(X_train, meta_train, contamination_overrides=overrides)
+    results = run_all_models(X_train, meta_train, model_params=best_params)
     results.to_csv(RESULTS_DIR / "model_results.csv", index=False)
     logger.info("Saved model results to %s", RESULTS_DIR / "model_results.csv")
 
     logger.info("Stage 4: Evaluation — injection recovery...")
-    if_model = IsolationForestDetector(contamination=overrides.get("IsolationForest", 0.05))
+    # Re-fit IF with its tuned params for use in Stages 5-7
+    if_model = IsolationForestDetector(**best_params.get("IsolationForest", {"contamination": 0.05}))
     if_model.fit(X_train)
 
+    # Capture best_params in closure default-args to avoid late-binding issues
     model_ctors = [
         (lambda: ZScoreBaseline(contamination=0.05), "ZScoreBaseline"),
-        (lambda: LOFDetector(contamination=overrides.get("LOF", 0.05)), "LOF"),
-        (lambda: IsolationForestDetector(contamination=overrides.get("IsolationForest", 0.05)), "IsolationForest"),
-        (lambda: OneClassSVMDetector(nu=overrides.get("OneClassSVM", 0.05)), "OneClassSVM"),
-        (lambda: AutoencoderDetector(input_dim=X_train.shape[1]), "Autoencoder"),
+        (lambda p=best_params.get("LOF", {"contamination": 0.05}):
+             LOFDetector(**p), "LOF"),
+        (lambda p=best_params.get("IsolationForest", {"contamination": 0.05}):
+             IsolationForestDetector(**p), "IsolationForest"),
+        (lambda p=best_params.get("OneClassSVM", {"nu": 0.05}):
+             OneClassSVMDetector(**p), "OneClassSVM"),
+        (lambda p=best_params.get("Autoencoder", {}):
+             AutoencoderDetector(input_dim=X_train.shape[1], **p), "Autoencoder"),
     ]
 
     # Stage 4a: Validation set evaluation (used for model comparison / selection)

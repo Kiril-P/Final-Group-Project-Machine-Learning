@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import joblib
 import numpy as np
@@ -26,9 +26,15 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from src.config import (
     AUTOENCODER_PARAMS,
+    AUTOENCODER_SEARCH,
+    AUTOENCODER_SEARCH_EPOCHS,
     ISOLATION_FOREST_PARAMS,
+    ISOLATION_FOREST_SEARCH,
+    LOF_SEARCH,
     MODELS_DIR,
     OCSVM_PARAMS,
+    OCSVM_SEARCH,
+    RANDOM_SEARCH_N_ITER,
     RANDOM_SEED,
 )
 
@@ -267,11 +273,9 @@ def tune_contamination(
     y_injected: np.ndarray,
     grid: Optional[list] = None,
 ) -> pd.DataFrame:
-    """Sweep contamination for IF, OCSVM, LOF using injection ROC-AUC as the objective.
+    """Lightweight contamination-only sweep (kept for notebook back-compat).
 
-    Returns a dataframe of (model, contamination, roc_auc) rows. ROC-AUC uses synthetic
-    ground-truth labels y_injected (1 = anomaly, 0 = normal) — this is principled because
-    we control the injected anomalies.
+    Prefer run_hyperparameter_search() for multi-parameter tuning.
     """
     grid = grid or [0.01, 0.03, 0.05, 0.10, 0.15]
     rows = []
@@ -290,32 +294,189 @@ def tune_contamination(
     return pd.DataFrame(rows)
 
 
+def run_hyperparameter_search(
+    X_train: np.ndarray,
+    X_val_injected: np.ndarray,
+    y_val_injected: np.ndarray,
+    n_iter: int = RANDOM_SEARCH_N_ITER,
+    random_state: int = RANDOM_SEED,
+) -> Tuple[pd.DataFrame, dict]:
+    """Random search over hyperparameters for all anomaly detectors.
+
+    Models are trained on X_train; selection is driven by ROC-AUC on
+    X_val_injected (validation data with synthetic anomalies pre-injected).
+    The test set is never touched during this phase.
+
+    For IF, OC-SVM, and LOF a full random search is run (n_iter draws each).
+    For the Autoencoder, architecture and threshold are searched with short
+    (30-epoch) training runs to keep compute cost practical; the winning config
+    is later re-trained at full epochs in the main pipeline.
+
+    Args:
+        X_train: Scaled training data (no injected anomalies).
+        X_val_injected: Validation data with synthetic anomalies already injected.
+        y_val_injected: Binary ground-truth labels (1=anomaly, 0=normal).
+        n_iter: Random draws per model for IF / OC-SVM / LOF.
+        random_state: Seed for reproducible sampling.
+
+    Returns:
+        all_results: DataFrame of every (model, params…, roc_auc) trial.
+        best_params: {model_name: {param: best_value}} for constructing final models.
+    """
+    rng = np.random.default_rng(random_state)
+    all_rows: list = []
+    best_params: dict = {}
+
+    # ── Fast models: full random search ──────────────────────────────────────
+    fast_spaces = {
+        "IsolationForest": ISOLATION_FOREST_SEARCH,
+        "OneClassSVM":     OCSVM_SEARCH,
+        "LOF":             LOF_SEARCH,
+    }
+
+    def _build(name: str, params: dict):
+        if name == "IsolationForest":
+            return IsolationForestDetector(**params)
+        if name == "OneClassSVM":
+            return OneClassSVMDetector(**params)
+        if name == "LOF":
+            return LOFDetector(**params)
+        raise ValueError(f"Unknown model: {name}")
+
+    for model_name, space in fast_spaces.items():
+        logger.info("Random search: %s  (%d iterations)...", model_name, n_iter)
+        model_rows: list = []
+
+        for i in range(n_iter):
+            # Sample one value per parameter uniformly from each candidate list
+            sampled: dict = {}
+            for param, candidates in space.items():
+                val = rng.choice(candidates)
+                sampled[param] = val.item() if isinstance(val, np.generic) else val
+
+            try:
+                m = _build(model_name, sampled)
+                m.fit(X_train)
+                auc = roc_auc_score(y_val_injected, m.score(X_val_injected))
+                row = {"model": model_name, **sampled, "roc_auc": auc}
+                model_rows.append(row)
+                all_rows.append(row)
+                logger.info(
+                    "  [%2d/%d] %s  %s  →  AUC=%.4f",
+                    i + 1, n_iter, model_name, sampled, auc,
+                )
+            except Exception as exc:
+                logger.warning("Search trial failed (%s iter %d): %s", model_name, i + 1, exc)
+
+        if model_rows:
+            best_row = max(model_rows, key=lambda r: r["roc_auc"])
+            best_params[model_name] = {
+                k: v for k, v in best_row.items() if k not in ("model", "roc_auc")
+            }
+            logger.info(
+                "Best %s → %s  (AUC=%.4f)",
+                model_name, best_params[model_name], best_row["roc_auc"],
+            )
+
+    # ── Autoencoder: lightweight architecture + threshold search ─────────────
+    # Full random search is impractical (100 epochs × many trials). Instead we
+    # run each trial at AUTOENCODER_SEARCH_EPOCHS epochs to cheaply rank configs,
+    # then select the best (encoding_dim, threshold_pct) for full re-training.
+    logger.info(
+        "Autoencoder search: %d configs × %d epochs each...",
+        len(AUTOENCODER_SEARCH["encoding_dim"]) * len(AUTOENCODER_SEARCH["reconstruction_threshold_percentile"]),
+        AUTOENCODER_SEARCH_EPOCHS,
+    )
+    ae_rows: list = []
+    for enc_dim in AUTOENCODER_SEARCH["encoding_dim"]:
+        for thr_pct in AUTOENCODER_SEARCH["reconstruction_threshold_percentile"]:
+            try:
+                ae = AutoencoderDetector(
+                    input_dim=X_train.shape[1],
+                    encoding_dim=enc_dim,
+                    epochs=AUTOENCODER_SEARCH_EPOCHS,
+                    reconstruction_threshold_percentile=thr_pct,
+                )
+                ae.fit(X_train)
+                auc = roc_auc_score(y_val_injected, ae.score(X_val_injected))
+                row = {
+                    "model": "Autoencoder",
+                    "encoding_dim": enc_dim,
+                    "reconstruction_threshold_percentile": thr_pct,
+                    "roc_auc": auc,
+                }
+                ae_rows.append(row)
+                all_rows.append(row)
+                logger.info(
+                    "  Autoencoder  encoding_dim=%d  threshold_pct=%d  →  AUC=%.4f",
+                    enc_dim, thr_pct, auc,
+                )
+            except Exception as exc:
+                logger.warning("AE search trial failed (enc=%d thr=%d): %s", enc_dim, thr_pct, exc)
+
+    if ae_rows:
+        best_ae = max(ae_rows, key=lambda r: r["roc_auc"])
+        best_params["Autoencoder"] = {
+            "encoding_dim": best_ae["encoding_dim"],
+            "reconstruction_threshold_percentile": best_ae["reconstruction_threshold_percentile"],
+        }
+        logger.info("Best Autoencoder → %s  (AUC=%.4f)", best_params["Autoencoder"], best_ae["roc_auc"])
+
+    all_results = (
+        pd.DataFrame(all_rows)
+        .sort_values(["model", "roc_auc"], ascending=[True, False])
+        .reset_index(drop=True)
+    )
+    return all_results, best_params
+
+
 def run_all_models(
     X: np.ndarray,
     meta: pd.DataFrame,
     contamination_overrides: Optional[dict] = None,
+    model_params: Optional[dict] = None,
 ) -> pd.DataFrame:
-    """Fit baselines + IF, OCSVM, Autoencoder; return meta + scores and ensemble vote.
+    """Fit all five detectors; return meta + scores, predictions, and ensemble vote.
 
-    `contamination_overrides` allows passing tuned values per model, e.g.
-    {"IsolationForest": 0.03, "OneClassSVM": 0.05, "LOF": 0.05, "ZScoreBaseline": 0.05}.
+    Args:
+        X: Scaled training feature matrix.
+        meta: Player metadata aligned with X rows.
+        contamination_overrides: Legacy single-value override — sets contamination
+            only (kept for notebook back-compat). Ignored per-model when model_params
+            provides a full param dict for that model.
+        model_params: Full per-model param dicts from run_hyperparameter_search(),
+            e.g. {"IsolationForest": {"contamination": 0.03, "n_estimators": 200}}.
+            Takes precedence over contamination_overrides for any model it covers.
     """
     overrides = contamination_overrides or {}
+    params = model_params or {}
+
+    def _kwargs(name: str, default_contamination: float = 0.05) -> dict:
+        """Return constructor kwargs: full search result > contamination override > default."""
+        if name in params:
+            return params[name]
+        c = overrides.get(name, default_contamination)
+        return {"contamination": c}
+
     results = meta.copy()
-    models = [
+    model_list = [
         ZScoreBaseline(contamination=overrides.get("ZScoreBaseline", 0.05)),
-        LOFDetector(contamination=overrides.get("LOF", 0.05)),
-        IsolationForestDetector(contamination=overrides.get("IsolationForest", 0.05)),
-        OneClassSVMDetector(nu=overrides.get("OneClassSVM", 0.05)),
-        AutoencoderDetector(input_dim=X.shape[1]),
+        LOFDetector(**_kwargs("LOF")),
+        IsolationForestDetector(**_kwargs("IsolationForest")),
+        OneClassSVMDetector(**({k: v for k, v in _kwargs("OneClassSVM").items()})),
+        AutoencoderDetector(
+            input_dim=X.shape[1],
+            **params.get("Autoencoder", {}),
+        ),
     ]
-    for m in models:
+
+    for m in model_list:
         logger.info("Fitting %s...", m.name)
         m.fit(X)
         results[f"{m.name}_score"] = m.score(X)
         results[f"{m.name}_label"] = m.predict(X)
 
-    # Ensemble vote uses the three "advanced" unsupervised models (IF, OCSVM, AE)
+    # Ensemble vote: flag players where ≥ 2 of the three advanced models agree
     advanced = ["IsolationForest", "OneClassSVM", "Autoencoder"]
     label_cols = [f"{n}_label" for n in advanced]
     results["anomaly_votes"] = (results[label_cols] == -1).sum(axis=1)

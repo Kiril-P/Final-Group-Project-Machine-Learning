@@ -84,3 +84,48 @@ AUTOENCODER_PARAMS = {
 
 N_SYNTHETIC_ANOMALIES = 50
 ALPHA = 0.05
+
+# ── Hyperparameter Search Spaces ─────────────────────────────────────────────
+#
+# Each dict maps parameter name -> list of candidate values.
+# run_hyperparameter_search() samples uniformly from these lists.
+#
+# Ranges are justified as follows:
+#   contamination / nu : 1–15 % covers plausible cheating prevalence estimates
+#                        found in prior chess integrity literature.
+#   n_estimators       : diminishing returns above 300 for this dataset size.
+#   max_samples        : "auto" = min(256, n) vs explicit fractions to balance
+#                        diversity and bias in each tree.
+#   n_neighbors (LOF)  : 10–40 spans local to semi-global density estimation.
+#   kernel / gamma     : standard RBF search; "poly" included as alternative.
+#   encoding_dim (AE)  : 2–8 spans lossy compression of a 6-feature input.
+#   threshold_pct (AE) : 90–99 controls recall/precision trade-off on recon error.
+
+RANDOM_SEARCH_N_ITER = 20  # random draws per model; ≈20 is cost-effective for this dataset size
+
+ISOLATION_FOREST_SEARCH: dict = {
+    "contamination": [0.01, 0.02, 0.03, 0.05, 0.08, 0.10, 0.15],
+    "n_estimators":  [100, 150, 200, 300],
+    "max_samples":   ["auto", 0.5, 0.8],
+}
+
+OCSVM_SEARCH: dict = {
+    "nu":     [0.01, 0.02, 0.03, 0.05, 0.08, 0.10, 0.15],
+    "kernel": ["rbf", "poly"],
+    "gamma":  ["scale", "auto"],
+}
+
+LOF_SEARCH: dict = {
+    "contamination": [0.01, 0.02, 0.03, 0.05, 0.08, 0.10, 0.15],
+    "n_neighbors":   [10, 15, 20, 30, 40],
+}
+
+# Autoencoder search is separated: architecture/threshold are searched with a
+# cheap short-run (30 epochs) to find good encoding_dim and threshold percentile,
+# then the best config is re-trained at full epochs.  Learning rate is kept fixed
+# to cap total search cost.
+AUTOENCODER_SEARCH: dict = {
+    "encoding_dim":                      [2, 4, 6, 8],
+    "reconstruction_threshold_percentile": [90, 93, 95, 97, 99],
+}
+AUTOENCODER_SEARCH_EPOCHS = 30   # epochs used during search trials (not final training)

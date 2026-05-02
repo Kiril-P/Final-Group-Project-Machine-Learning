@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 
 from src.config import RANDOM_SEED, RESULTS_DIR
 from src.data_loader import load_and_prepare
@@ -69,25 +70,47 @@ def main(use_acpl: bool = False, time_control: str = "blitz"):
         else:
             logger.warning("Stockfish unavailable — skipping ACPL features.")
 
-    X, meta, _scaler = get_feature_matrix(agg, use_acpl=use_acpl, time_control=time_control)
-    feature_names = list(X.columns)
-    X_arr = X.values
+    # fit_scaler=False: raw (unscaled) features returned so the scaler can be fit
+    # exclusively on the training partition — prevents test-set statistics leaking
+    # into the scaler's mean/std and contaminating evaluation metrics.
+    X_raw, meta, _ = get_feature_matrix(agg, use_acpl=use_acpl, time_control=time_control, fit_scaler=False)
+    feature_names = list(X_raw.columns)
+    X_arr = X_raw.values
 
     agg.to_csv(RESULTS_DIR / "player_features.csv", index=False)
     logger.info("Saved player features to %s", RESULTS_DIR / "player_features.csv")
 
-    logger.info("Stage 2a: Train/holdout split (80/20)...")
-    train_idx, test_idx = train_test_split(
-        np.arange(len(X_arr)), test_size=0.2, random_state=RANDOM_SEED
+    # ── Stage 2a: 70 / 15 / 15 train / val / test split ────────────────────
+    # Split is performed on raw (unscaled) data so the scaler never sees val/test.
+    logger.info("Stage 2a: Train / val / test split (70 / 15 / 15)...")
+    train_idx, temp_idx = train_test_split(
+        np.arange(len(X_arr)), test_size=0.30, random_state=RANDOM_SEED
     )
-    X_train, X_test = X_arr[train_idx], X_arr[test_idx]
-    meta_train = meta.iloc[train_idx].reset_index(drop=True)
-    meta_test = meta.iloc[test_idx].reset_index(drop=True)
-    logger.info("Train: %s players, Holdout: %s players", len(X_train), len(X_test))
+    val_idx, test_idx = train_test_split(
+        temp_idx, test_size=0.50, random_state=RANDOM_SEED
+    )
 
-    logger.info("Stage 2b: Hyperparameter tuning on train split (subtle injection)...")
+    # ── Stage 2b: Fit scaler on training data only, then transform each split ─
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_arr[train_idx])   # learns mean/std from train
+    X_val   = scaler.transform(X_arr[val_idx])          # applies same transform
+    X_test  = scaler.transform(X_arr[test_idx])         # test is truly unseen
+
+    meta_train = meta.iloc[train_idx].reset_index(drop=True)
+    meta_val   = meta.iloc[val_idx].reset_index(drop=True)
+    meta_test  = meta.iloc[test_idx].reset_index(drop=True)
+    logger.info(
+        "Split sizes — Train: %s | Val: %s | Test: %s",
+        len(X_train), len(X_val), len(X_test),
+    )
+
+    # ── Stage 2c: Hyperparameter tuning on validation set ───────────────────
+    # Inject synthetic anomalies into the val set and search for the contamination
+    # rate that maximises ROC-AUC on that held-out partition.  The test set is
+    # never touched during tuning.
+    logger.info("Stage 2c: Hyperparameter tuning on val split (subtle injection)...")
     X_inj_tune, y_inj_tune = inject_synthetic_anomalies(
-        pd.DataFrame(X_train, columns=feature_names), n=50, strategy="subtle"
+        pd.DataFrame(X_val, columns=feature_names), n=50, strategy="subtle"
     )
     X_inj_arr = X_inj_tune.values if hasattr(X_inj_tune, "values") else X_inj_tune
     tuning_df = tune_contamination(X_train, X_inj_arr, y_inj_tune)
@@ -101,31 +124,51 @@ def main(use_acpl: bool = False, time_control: str = "blitz"):
     results.to_csv(RESULTS_DIR / "model_results.csv", index=False)
     logger.info("Saved model results to %s", RESULTS_DIR / "model_results.csv")
 
-    logger.info("Stage 4: Holdout evaluation — injection recovery on unseen data...")
+    logger.info("Stage 4: Evaluation — injection recovery...")
     if_model = IsolationForestDetector(contamination=overrides.get("IsolationForest", 0.05))
     if_model.fit(X_train)
 
-    holdout_rows = []
+    model_ctors = [
+        (lambda: ZScoreBaseline(contamination=0.05), "ZScoreBaseline"),
+        (lambda: LOFDetector(contamination=overrides.get("LOF", 0.05)), "LOF"),
+        (lambda: IsolationForestDetector(contamination=overrides.get("IsolationForest", 0.05)), "IsolationForest"),
+        (lambda: OneClassSVMDetector(nu=overrides.get("OneClassSVM", 0.05)), "OneClassSVM"),
+        (lambda: AutoencoderDetector(input_dim=X_train.shape[1]), "Autoencoder"),
+    ]
+
+    # Stage 4a: Validation set evaluation (used for model comparison / selection)
+    logger.info("Stage 4a: Validation set evaluation...")
+    val_rows = []
+    for strategy in ("engine_perfect", "subtle"):
+        X_inj_val, y_inj_val = inject_synthetic_anomalies(
+            pd.DataFrame(X_val, columns=feature_names), n=50, strategy=strategy
+        )
+        for ctor, name in model_ctors:
+            m = ctor()
+            m.fit(X_train)
+            metrics = evaluate_injection_recovery(m, X_inj_val, y_inj_val)
+            val_rows.append({"model": name, "strategy": strategy, "split": "val", **metrics})
+    val_df = pd.DataFrame(val_rows)
+    val_df.to_csv(RESULTS_DIR / "val_evaluation.csv", index=False)
+    logger.info("Validation evaluation saved.\n%s", val_df.to_string(index=False))
+
+    # Stage 4b: Test set evaluation — touched once, final reported numbers only
+    logger.info("Stage 4b: Test set evaluation (final, unseen)...")
+    test_rows = []
     for strategy in ("engine_perfect", "subtle"):
         X_inj_eval, y_inj_eval = inject_synthetic_anomalies(
             pd.DataFrame(X_test, columns=feature_names), n=50, strategy=strategy
         )
-        for ctor, name in [
-            (lambda: ZScoreBaseline(contamination=0.05), "ZScoreBaseline"),
-            (lambda: LOFDetector(contamination=overrides.get("LOF", 0.05)), "LOF"),
-            (lambda: IsolationForestDetector(contamination=overrides.get("IsolationForest", 0.05)), "IsolationForest"),
-            (lambda: OneClassSVMDetector(nu=overrides.get("OneClassSVM", 0.05)), "OneClassSVM"),
-            (lambda: AutoencoderDetector(input_dim=X_train.shape[1]), "Autoencoder"),
-        ]:
+        for ctor, name in model_ctors:
             m = ctor()
             m.fit(X_train)
             metrics = evaluate_injection_recovery(m, X_inj_eval, y_inj_eval)
-            holdout_rows.append({"model": name, "strategy": strategy, **metrics})
-    holdout_df = pd.DataFrame(holdout_rows)
+            test_rows.append({"model": name, "strategy": strategy, "split": "test", **metrics})
+    holdout_df = pd.DataFrame(test_rows)
     holdout_df.to_csv(RESULTS_DIR / "holdout_evaluation.csv", index=False)
-    logger.info("Holdout evaluation saved.\n%s", holdout_df.to_string(index=False))
+    logger.info("Test evaluation saved.\n%s", holdout_df.to_string(index=False))
 
-    # Keep a reference single-strategy injection result for back-compat with notebook
+    # Reference injection result (IF on test, subtle) for notebook back-compat
     X_inj, y_inj = inject_synthetic_anomalies(
         pd.DataFrame(X_test, columns=feature_names), n=50, strategy="subtle"
     )

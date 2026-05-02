@@ -84,6 +84,7 @@ def get_feature_matrix(
     df: pd.DataFrame,
     use_acpl: bool = False,
     time_control: Optional[str] = None,
+    fit_scaler: bool = True,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, StandardScaler]:
     """
     Return (feature_matrix, metadata, scaler) ready for anomaly detection.
@@ -92,6 +93,11 @@ def get_feature_matrix(
         df: Player-level dataframe with engineered features.
         use_acpl: Include ACPL columns when present.
         time_control: If set, keep players whose dominant TC matches (e.g. 'blitz').
+        fit_scaler: When True (default), fits StandardScaler on the supplied data and
+            returns scaled features — suitable for one-shot use (e.g. notebooks, EDA).
+            Set to False when the caller will split the data first and fit the scaler
+            only on the training partition; the returned scaler is unfitted and the
+            feature matrix contains raw (unscaled) values.
     """
     if time_control:
         df = df[df["time_control_cat"] == time_control].copy()
@@ -114,15 +120,21 @@ def get_feature_matrix(
     if n_dropped > 0:
         logger.warning("Dropped %s players with NaN in features", n_dropped)
 
-    X_raw = df_clean[features]
+    X_raw = df_clean[features].reset_index(drop=True)
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_raw)
-    X = pd.DataFrame(X_scaled, columns=features, index=df_clean.index)
+
+    if fit_scaler:
+        X = pd.DataFrame(scaler.fit_transform(X_raw), columns=features)
+    else:
+        # Caller is responsible for fitting the scaler on the training split only.
+        X = X_raw.copy()
 
     meta = df_clean[["player_id", "avg_rating", "rating_band", "n_games"]].reset_index(drop=True)
-    X = X.reset_index(drop=True)
 
-    logger.info("Feature matrix: %s players × %s features", X.shape[0], X.shape[1])
+    logger.info(
+        "Feature matrix: %s players × %s features (scaled=%s)",
+        X.shape[0], X.shape[1], fit_scaler,
+    )
     return X, meta, scaler
 
 

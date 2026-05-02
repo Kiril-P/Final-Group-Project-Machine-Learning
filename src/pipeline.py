@@ -36,6 +36,7 @@ from src.models import (
 from src.validation import (
     compute_davies_bouldin,
     compute_silhouette,
+    cross_validate_anomaly_models,
     evaluate_injection_recovery,
     inject_synthetic_anomalies,
     test_anomaly_vs_normal,
@@ -126,6 +127,26 @@ def main(use_acpl: bool = False, time_control: str = "blitz"):
     )
     search_results.to_csv(RESULTS_DIR / "hyperparameter_tuning.csv", index=False)
     logger.info("Best params per model:\n%s", {k: v for k, v in best_params.items()})
+
+    # ── Stage 2d: 5-fold cross-validation for variance estimation ────────────
+    # Runs on the development set (train + val) only — the test set is never
+    # involved.  Within every fold the scaler is re-fit on the fold's training
+    # rows so there is no leakage even inside CV.  Produces mean ± std and 95 %
+    # CI for each metric, letting the report say e.g. "ROC-AUC 0.72 ± 0.04"
+    # rather than a single number that could be a lucky split.
+    logger.info("Stage 2d: 5-fold cross-validation (development set only)...")
+    dev_idx = np.concatenate([train_idx, val_idx])
+    cv_raw, cv_summary = cross_validate_anomaly_models(
+        X=X_arr[dev_idx],          # raw (unscaled) development data
+        feature_names=feature_names,
+        best_params=best_params,
+    )
+    cv_raw.to_csv(RESULTS_DIR / "cv_raw_results.csv", index=False)
+    cv_summary.to_csv(RESULTS_DIR / "cv_summary.csv", index=False)
+    logger.info(
+        "CV summary (ROC-AUC):\n%s",
+        cv_summary[["model", "roc_auc_mean", "roc_auc_std", "roc_auc_ci95"]].to_string(index=False),
+    )
 
     logger.info("Stage 3: Training anomaly detection models on train split...")
     results = run_all_models(X_train, meta_train, model_params=best_params)

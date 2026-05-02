@@ -5,7 +5,7 @@ Validation for label-free anomaly detection: synthetic injection, ACPL correlati
 from __future__ import annotations
 
 import logging
-from typing import Dict
+from typing import Dict, Tuple
 
 import numpy as np
 import pandas as pd
@@ -18,8 +18,10 @@ from sklearn.metrics import (
     roc_auc_score,
     silhouette_score,
 )
+from sklearn.model_selection import KFold
+from sklearn.preprocessing import StandardScaler
 
-from src.config import ALPHA, N_SYNTHETIC_ANOMALIES, RANDOM_SEED
+from src.config import ALPHA, AUTOENCODER_SEARCH_EPOCHS, N_SYNTHETIC_ANOMALIES, RANDOM_SEED
 
 logger = logging.getLogger(__name__)
 rng = np.random.default_rng(RANDOM_SEED)
@@ -154,3 +156,115 @@ def compute_davies_bouldin(X: np.ndarray, labels: np.ndarray) -> float:
     score = davies_bouldin_score(X, binary_labels)
     logger.info("Davies-Bouldin index: %.4f", score)
     return float(score)
+
+
+def cross_validate_anomaly_models(
+    X: np.ndarray,
+    feature_names: list,
+    best_params: dict,
+    n_splits: int = 5,
+    n_injected: int = 50,
+    injection_strategy: str = "subtle",
+    random_state: int = RANDOM_SEED,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """K-fold cross-validation for all anomaly detectors.
+
+    Splits the development set (train + val; test excluded by the caller)
+    into k folds.  For each fold the StandardScaler is fit on the k-1
+    training folds and applied to the held-out fold — no leakage within
+    CV.  Ground truth comes from synthetic injection into each test fold.
+
+    Args:
+        X: Raw (unscaled) development-set feature matrix.
+        feature_names: Column names matching X's columns.
+        best_params: Tuned param dicts from run_hyperparameter_search().
+        n_splits: Number of folds (default 5).
+        n_injected: Synthetic anomalies injected per test fold.
+        injection_strategy: Injection strategy passed to inject_synthetic_anomalies().
+        random_state: Seed for KFold shuffle.
+
+    Returns:
+        raw_df: One row per (fold × model) with every metric value.
+        summary_df: Mean, std, and 95 % CI across folds per (model × metric).
+    """
+    # Late import to avoid circular dependency (models → config, validation → config)
+    from src.models import (
+        AutoencoderDetector,
+        IsolationForestDetector,
+        LOFDetector,
+        OneClassSVMDetector,
+        ZScoreBaseline,
+    )
+
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    raw_rows: list = []
+    metric_cols = ["roc_auc", "average_precision", "precision_at_k", "recall_at_k"]
+
+    for fold_idx, (tr_idx, te_idx) in enumerate(kf.split(X)):
+        logger.info("CV fold %d / %d...", fold_idx + 1, n_splits)
+
+        # Scaler fit on this fold's training rows only — mirrors the main pipeline
+        scaler = StandardScaler()
+        X_tr = scaler.fit_transform(X[tr_idx])
+        X_te = scaler.transform(X[te_idx])
+
+        # Inject synthetic anomalies into the test fold to get labelled ground truth
+        X_inj, y_inj = inject_synthetic_anomalies(
+            pd.DataFrame(X_te, columns=feature_names),
+            n=n_injected,
+            strategy=injection_strategy,
+        )
+        X_inj_arr = X_inj if isinstance(X_inj, np.ndarray) else X_inj.values
+
+        # Build every model with its tuned parameters.
+        # Autoencoder uses reduced epochs (AUTOENCODER_SEARCH_EPOCHS) during CV
+        # to keep wall-clock time practical; final performance is still reported
+        # on the held-out test set with full training.
+        models = [
+            ("ZScoreBaseline", ZScoreBaseline(contamination=0.05)),
+            ("LOF",            LOFDetector(**best_params.get("LOF", {"contamination": 0.05}))),
+            ("IsolationForest", IsolationForestDetector(**best_params.get("IsolationForest", {"contamination": 0.05}))),
+            ("OneClassSVM",    OneClassSVMDetector(**best_params.get("OneClassSVM", {"nu": 0.05}))),
+            ("Autoencoder",    AutoencoderDetector(
+                input_dim=X_tr.shape[1],
+                epochs=AUTOENCODER_SEARCH_EPOCHS,
+                **best_params.get("Autoencoder", {}),
+            )),
+        ]
+
+        for name, m in models:
+            try:
+                m.fit(X_tr)
+                metrics = evaluate_injection_recovery(m, X_inj_arr, y_inj)
+                raw_rows.append({"fold": fold_idx + 1, "model": name, **metrics})
+            except Exception as exc:
+                logger.warning("CV fold %d %s failed: %s", fold_idx + 1, name, exc)
+
+    raw_df = pd.DataFrame(raw_rows)
+
+    # Summarise: mean, std, and 95 % CI across folds per model
+    summary_rows: list = []
+    for model_name, grp in raw_df.groupby("model"):
+        row: dict = {"model": model_name}
+        for metric in metric_cols:
+            if metric not in grp.columns:
+                continue
+            vals = grp[metric].dropna()
+            n = len(vals)
+            mean, std = float(vals.mean()), float(vals.std(ddof=1))
+            row[f"{metric}_mean"] = mean
+            row[f"{metric}_std"]  = std
+            row[f"{metric}_ci95"] = float(1.96 * std / np.sqrt(n)) if n > 1 else float("nan")
+        summary_rows.append(row)
+
+    summary_df = (
+        pd.DataFrame(summary_rows)
+        .sort_values("roc_auc_mean", ascending=False)
+        .reset_index(drop=True)
+    )
+    logger.info(
+        "CV complete (%d folds).\n%s",
+        n_splits,
+        summary_df[["model", "roc_auc_mean", "roc_auc_std"]].to_string(index=False),
+    )
+    return raw_df, summary_df

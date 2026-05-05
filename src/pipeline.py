@@ -23,6 +23,8 @@ from src.interpretation import (
     permutation_feature_importance,
     plot_anomaly_score_distribution,
     plot_feature_importance,
+    plot_learning_curves,
+    plot_roc_curves,
 )
 from src.models import (
     AutoencoderDetector,
@@ -190,18 +192,30 @@ def main(use_acpl: bool = False, time_control: str = "blitz"):
     # Stage 4b: Test set evaluation — touched once, final reported numbers only
     logger.info("Stage 4b: Test set evaluation (final, unseen)...")
     test_rows = []
+    # Collect raw scores from the subtle strategy for the ROC curve plot.
+    roc_scores: dict = {}
+    roc_y_true: np.ndarray | None = None
     for strategy in ("engine_perfect", "subtle"):
         X_inj_eval, y_inj_eval = inject_synthetic_anomalies(
             pd.DataFrame(X_test, columns=feature_names), n=50, strategy=strategy
         )
+        X_inj_eval_arr = X_inj_eval if isinstance(X_inj_eval, np.ndarray) else X_inj_eval.values
         for ctor, name in model_ctors:
             m = ctor()
             m.fit(X_train)
-            metrics = evaluate_injection_recovery(m, X_inj_eval, y_inj_eval)
+            metrics = evaluate_injection_recovery(m, X_inj_eval_arr, y_inj_eval)
             test_rows.append({"model": name, "strategy": strategy, "split": "test", **metrics})
+            if strategy == "subtle":
+                roc_scores[name] = m.score(X_inj_eval_arr)
+                roc_y_true = y_inj_eval
     holdout_df = pd.DataFrame(test_rows)
     holdout_df.to_csv(RESULTS_DIR / "holdout_evaluation.csv", index=False)
     logger.info("Test evaluation saved.\n%s", holdout_df.to_string(index=False))
+
+    logger.info("Stage 4b (cont): Plotting ROC curves (subtle, test set)...")
+    if roc_y_true is not None:
+        roc_df = plot_roc_curves(roc_scores, roc_y_true)
+        roc_df.to_csv(RESULTS_DIR / "roc_curves.csv", index=False)
 
     # Reference injection result (IF on test, subtle) for notebook back-compat
     X_inj, y_inj = inject_synthetic_anomalies(
@@ -224,7 +238,22 @@ def main(use_acpl: bool = False, time_control: str = "blitz"):
     db = compute_davies_bouldin(X_train, if_labels)
     logger.info("Silhouette: %s, Davies-Bouldin: %s", sil, db)
 
-    logger.info("Stage 6: Feature importance...")
+    logger.info("Stage 6: Feature importance and learning curves...")
+    # Learning curves: inject once on val, then train each model on increasing
+    # fractions of X_train to show convergence behaviour.
+    X_lc_inj, y_lc_inj = inject_synthetic_anomalies(
+        pd.DataFrame(X_val, columns=feature_names), n=50, strategy="subtle"
+    )
+    X_lc_arr = X_lc_inj if isinstance(X_lc_inj, np.ndarray) else X_lc_inj.values
+    lc_df = plot_learning_curves(
+        X_train=X_train,
+        X_val_injected=X_lc_arr,
+        y_val_injected=y_lc_inj,
+        best_params=best_params,
+        feature_names=feature_names,
+    )
+    lc_df.to_csv(RESULTS_DIR / "learning_curves.csv", index=False)
+
     importance_df = permutation_feature_importance(if_model, X_train, feature_names)
     importance_df.to_csv(RESULTS_DIR / "feature_importance.csv", index=False)
     plot_feature_importance(importance_df)

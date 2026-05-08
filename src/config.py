@@ -135,8 +135,11 @@ RANDOM_SEARCH_N_ITER = 20  # 20 random draws per model — cost-effective for th
 ISOLATION_FOREST_SEARCH: dict = {
     "contamination": [0.01, 0.02, 0.03, 0.05, 0.08, 0.10, 0.15],
     "n_estimators":  [100, 150, 200, 300],
-    # NOTE: must be "auto" or integers — newer sklearn rejects float fractions (0.5, 0.8)
-    "max_samples":   ["auto", 128, 256],
+    # Must be "auto" or an integer. We keep only "auto" because numpy's rng.choice()
+    # on a mixed list (string + int) upcasts everything to string, which causes sklearn
+    # to reject the value. "auto" = min(256, n_samples) which is exactly what we want
+    # anyway with 20k+ training players.
+    "max_samples":   ["auto"],
 }
 
 OCSVM_SEARCH: dict = {

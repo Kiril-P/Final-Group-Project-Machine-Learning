@@ -110,6 +110,12 @@ def to_player_level(df: pd.DataFrame) -> pd.DataFrame:
     white["player_rating"] = white["white_rating"]
     white["opponent_rating"] = white["black_rating"]
     white["won"] = (white["winner"] == "white").astype(int)
+
+    # We need a 3-valued result (1.0/0.5/0.0) rather than just binary won/lost because
+    # the standard Elo performance rating formula treats draws differently from losses —
+    # a draw against a 400-point stronger opponent is impressive; a loss isn't.
+    # Using binary won would undercount the performance of players who draw a lot.
+    white["result"] = white["winner"].map({"white": 1.0, "draw": 0.5, "black": 0.0}).fillna(0.0)
     white["color"] = "white"
 
     black = df.copy()
@@ -117,10 +123,16 @@ def to_player_level(df: pd.DataFrame) -> pd.DataFrame:
     black["player_rating"] = black["black_rating"]
     black["opponent_rating"] = black["white_rating"]
     black["won"] = (black["winner"] == "black").astype(int)
+    black["result"] = black["winner"].map({"black": 1.0, "draw": 0.5, "white": 0.0}).fillna(0.0)
     black["color"] = "black"
 
+    # Stack both perspectives into a single player-game table.
+    # Now every game contributes two rows — one per player — which is what we want
+    # since we're building per-player aggregates, not per-game summaries.
     combined = pd.concat([white, black], ignore_index=True)
 
+    # Drop players with very few games — their stats are too noisy to trust.
+    # A player with 3 games and a 100% win rate tells us nothing useful.
     game_counts = combined["player_id"].value_counts()
     valid_players = game_counts[game_counts >= MIN_GAMES_PER_PLAYER].index
     combined = combined[combined["player_id"].isin(valid_players)]

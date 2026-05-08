@@ -10,13 +10,16 @@ import json
 import logging
 from pathlib import Path
 
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
-from src.config import RANDOM_SEED, RESULTS_DIR
+from src.config import DATA_LICHESS, LICHESS_SAMPLE_N, LICHESS_TIME_CONTROLS, RANDOM_SEED, RESULTS_DIR
 from src.data_loader import load_and_prepare
+from src.lichess_loader import load_and_prepare_lichess
 from src.features import aggregate_player_stats, add_engineered_features, get_feature_matrix
 from src.interpretation import (
     analyze_false_positives,
@@ -49,13 +52,35 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def main(use_acpl: bool = False, time_control: str = "blitz"):
+def main(
+    use_acpl: bool = False,
+    time_control: Optional[str] = None,
+    dataset: str = "small",
+    feature_set: str = "base",
+):
+    """
+    Run the full anomaly detection pipeline.
+
+    Args:
+        use_acpl:     Run Stockfish ACPL (small dataset only, slow).
+        time_control: Filter to one time control, e.g. 'blitz'. None = all.
+        dataset:      'small' (20 k-game Kaggle CSV) or 'lichess' (6.25 M-game dataset).
+        feature_set:  'base' (8 features) or 'extended' (up to 14, Lichess only).
+    """
     logger.info("=" * 60)
     logger.info("Chess behavioral anomaly detection — full pipeline")
+    logger.info("dataset=%s  feature_set=%s  time_control=%s", dataset, feature_set, time_control)
     logger.info("=" * 60)
 
     logger.info("Stage 1: Loading data...")
-    game_df, player_df = load_and_prepare()
+    if dataset == "lichess":
+        game_df, player_df = load_and_prepare_lichess(
+            DATA_LICHESS,
+            sample_n=LICHESS_SAMPLE_N,
+            time_controls=LICHESS_TIME_CONTROLS,
+        )
+    else:
+        game_df, player_df = load_and_prepare()
 
     logger.info("Stage 2: Engineering features...")
     agg = aggregate_player_stats(player_df)
@@ -71,10 +96,14 @@ def main(use_acpl: bool = False, time_control: str = "blitz"):
         else:
             logger.warning("Stockfish unavailable — skipping ACPL features.")
 
-    # fit_scaler=False: raw (unscaled) features returned so the scaler can be fit
-    # exclusively on the training partition — prevents test-set statistics leaking
-    # into the scaler's mean/std and contaminating evaluation metrics.
-    X_raw, meta, _ = get_feature_matrix(agg, use_acpl=use_acpl, time_control=time_control, fit_scaler=False)
+    # fit_scaler=False: return raw (unscaled) features here so the scaler can later be
+    # fit exclusively on the training partition. If we scaled everything upfront, the
+    # scaler's mean/std would include test-set information — a form of data leakage
+    # that makes validation metrics look better than they'd be on truly new data.
+    X_raw, meta, _ = get_feature_matrix(
+        agg, use_acpl=use_acpl, time_control=time_control,
+        fit_scaler=False, feature_set=feature_set,
+    )
     feature_names = list(X_raw.columns)
     X_arr = X_raw.values
 
@@ -82,7 +111,10 @@ def main(use_acpl: bool = False, time_control: str = "blitz"):
     logger.info("Saved player features to %s", RESULTS_DIR / "player_features.csv")
 
     # ── Stage 2a: 70 / 15 / 15 train / val / test split ────────────────────
-    # Split is performed on raw (unscaled) data so the scaler never sees val/test.
+    # 70% train: models learn from this.
+    # 15% val: used for hyperparameter search and model selection (never in final numbers).
+    # 15% test: touched exactly once at the end to report final performance — no peeking.
+    # Split on raw data so the scaler we fit below never "sees" val or test statistics.
     logger.info("Stage 2a: Train / val / test split (70 / 15 / 15)...")
     train_idx, temp_idx = train_test_split(
         np.arange(len(X_arr)), test_size=0.30, random_state=RANDOM_SEED
@@ -92,10 +124,13 @@ def main(use_acpl: bool = False, time_control: str = "blitz"):
     )
 
     # ── Stage 2b: Fit scaler on training data only, then transform each split ─
+    # StandardScaler learns mean and std from X_train rows only.
+    # The same learned parameters are then applied to val and test — no new fitting.
+    # This is the correct way to normalise; fitting on all data would be leakage.
     scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_arr[train_idx])   # learns mean/std from train
-    X_val   = scaler.transform(X_arr[val_idx])          # applies same transform
-    X_test  = scaler.transform(X_arr[test_idx])         # test is truly unseen
+    X_train = scaler.fit_transform(X_arr[train_idx])   # learns mean/std from train only
+    X_val   = scaler.transform(X_arr[val_idx])          # applies same transform (no refit)
+    X_test  = scaler.transform(X_arr[test_idx])         # test is truly unseen until Stage 4b
 
     meta_train = meta.iloc[train_idx].reset_index(drop=True)
     meta_val   = meta.iloc[val_idx].reset_index(drop=True)
@@ -106,9 +141,12 @@ def main(use_acpl: bool = False, time_control: str = "blitz"):
     )
 
     # ── Stage 2c: Multi-parameter random search on the validation set ────────
-    # Synthetic anomalies are injected into the val split to create a labelled
-    # evaluation set.  Models are trained on X_train and scored on val+injected,
-    # so the test set is never seen during model selection.
+    # We inject synthetic anomalies into the val split to get labelled data for
+    # hyperparameter optimisation. Without ground-truth cheater labels, this is the
+    # best way to objectively compare model configurations.
+    #
+    # "subtle" strategy: anomalies that look plausible but are statistically outlying —
+    # chosen because obvious anomalies are easy and don't differentiate models.
     #
     # IF / OC-SVM / LOF: 20-iteration random search over contamination AND
     #   structural params (n_estimators, n_neighbors, kernel, etc.).
@@ -129,11 +167,10 @@ def main(use_acpl: bool = False, time_control: str = "blitz"):
     logger.info("Best params per model:\n%s", {k: v for k, v in best_params.items()})
 
     # ── Stage 2d: 5-fold cross-validation for variance estimation ────────────
-    # Runs on the development set (train + val) only — the test set is never
-    # involved.  Within every fold the scaler is re-fit on the fold's training
-    # rows so there is no leakage even inside CV.  Produces mean ± std and 95 %
-    # CI for each metric, letting the report say e.g. "ROC-AUC 0.72 ± 0.04"
-    # rather than a single number that could be a lucky split.
+    # Runs on the development set (train + val) only — the test set is never involved.
+    # Within every fold, the scaler is re-fit on the fold's training rows, so there's
+    # zero leakage even inside CV. This lets us report "ROC-AUC 0.79 ± 0.03 (95% CI)"
+    # rather than a single number that might be a lucky split artifact.
     logger.info("Stage 2d: 5-fold cross-validation (development set only)...")
     dev_idx = np.concatenate([train_idx, val_idx])
     cv_raw, cv_summary = cross_validate_anomaly_models(
@@ -187,7 +224,9 @@ def main(use_acpl: bool = False, time_control: str = "blitz"):
     val_df.to_csv(RESULTS_DIR / "val_evaluation.csv", index=False)
     logger.info("Validation evaluation saved.\n%s", val_df.to_string(index=False))
 
-    # Stage 4b: Test set evaluation — touched once, final reported numbers only
+    # Stage 4b: Test set evaluation — touched exactly once, these are the numbers in the report.
+    # No further tuning happens after this; looking at test results and then adjusting
+    # hyperparameters would invalidate the evaluation entirely.
     logger.info("Stage 4b: Test set evaluation (final, unseen)...")
     test_rows = []
     for strategy in ("engine_perfect", "subtle"):
@@ -240,4 +279,6 @@ def main(use_acpl: bool = False, time_control: str = "blitz"):
 
 
 if __name__ == "__main__":
-    main(use_acpl=False, time_control="blitz")
+    # Switch to dataset="lichess", feature_set="extended" once lichess_jul2016.csv
+    # is placed in data/raw/.  Until then, keep dataset="small" to verify nothing broke.
+    main(dataset="lichess", feature_set="extended", time_control=None)

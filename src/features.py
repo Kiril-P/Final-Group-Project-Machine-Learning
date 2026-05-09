@@ -199,6 +199,42 @@ def add_engineered_features(agg: pd.DataFrame) -> pd.DataFrame:
     else:
         df["comeback_rate"] = np.nan
 
+    # ── Within-rating-band normalization for eval features ────────────────────
+    # avg_acpl and best_move_rate both depend heavily on Elo: a 1200-rated player
+    # naturally has much higher ACPL and lower best-move rate than a 2000-rated player.
+    # Without band normalization, the model would compare these across skill levels,
+    # which is unfair and noisy.
+    #
+    # We only do this for avg_acpl and best_move_rate, NOT for blunder_rate, comeback_rate,
+    # or time_pressure_rate — those are roughly Elo-independent (a blunder is a blunder
+    # regardless of rating, and engine users don't run out of time at any rating).
+    #
+    # We keep the raw columns intact and add new *_band_z columns.
+    # The raw values are still in player_features.csv for reporting and explainability.
+    # Band z-scores are computed on the full population (all 28k players), which is fine
+    # here — these are "contextual" statistics (what's normal for a 1400-rated player?)
+    # rather than learned model parameters, so using all data doesn't cause leakage.
+    for raw_feat, z_feat in [
+        ("avg_acpl",        "avg_acpl_band_z"),
+        ("best_move_rate",  "best_move_rate_band_z"),
+    ]:
+        if raw_feat in df.columns and "rating_band" in df.columns:
+            df[z_feat] = np.nan
+            for band in df["rating_band"].dropna().unique():
+                mask = df["rating_band"] == band
+                col = df.loc[mask, raw_feat].dropna()
+                if len(col) < 2:
+                    continue
+                mean, std = float(col.mean()), float(col.std())
+                if std > 0:
+                    df.loc[mask, z_feat] = (df.loc[mask, raw_feat] - mean) / std
+                else:
+                    df.loc[mask, z_feat] = 0.0
+            n_computed = df[z_feat].notna().sum()
+            logger.info(
+                "Within-band z-score '%s' computed for %s players", z_feat, n_computed
+            )
+
     logger.info("Engineered features added. Shape: %s", df.shape)
     return df
 
@@ -263,12 +299,12 @@ def get_feature_matrix(
     # those players from the model entirely, which is worse than not having the feature.
     if feature_set == "extended":
         extended_candidates = [
-            "move_time_cv",        # strongest cheating signal — uniform think times
-            "time_pressure_rate",  # engine users don't run out of time
-            "avg_acpl",            # lower ACPL at lower ratings = suspicious
-            "blunder_rate",        # engines almost never blunder
-            "best_move_rate",      # engines almost always find the best move
-            "comeback_rate",       # engines escape losing positions at superhuman rates
+            "move_time_cv",           # strongest cheating signal — uniform think times
+            "time_pressure_rate",     # engine users don't run out of time
+            "avg_acpl_band_z",        # ACPL z-score within rating band (see features.py)
+            "blunder_rate",           # engines almost never blunder (Elo-independent)
+            "best_move_rate_band_z",  # best-move rate z-score within rating band
+            "comeback_rate",          # engines escape losing positions at superhuman rates
         ]
         for feat in extended_candidates:
             if feat in df.columns:

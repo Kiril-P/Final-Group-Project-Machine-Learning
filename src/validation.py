@@ -190,6 +190,7 @@ def cross_validate_anomaly_models(
     # Late import to avoid circular dependency (models → config, validation → config)
     from src.models import (
         AutoencoderDetector,
+        HDBSCANDetector,
         IsolationForestDetector,
         LOFDetector,
         OneClassSVMDetector,
@@ -230,6 +231,8 @@ def cross_validate_anomaly_models(
                 epochs=AUTOENCODER_SEARCH_EPOCHS,
                 **best_params.get("Autoencoder", {}),
             )),
+            # HDBSCAN uses reduced min_cluster_size fallback if search hasn't run yet
+            ("HDBSCAN",        HDBSCANDetector(**best_params.get("HDBSCAN", {"min_cluster_size": 15}))),
         ]
 
         for name, m in models:

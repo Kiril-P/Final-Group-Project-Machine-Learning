@@ -28,6 +28,8 @@ from src.config import (
     AUTOENCODER_PARAMS,
     AUTOENCODER_SEARCH,
     AUTOENCODER_SEARCH_EPOCHS,
+    HDBSCAN_PARAMS,
+    HDBSCAN_SEARCH,
     ISOLATION_FOREST_PARAMS,
     ISOLATION_FOREST_SEARCH,
     LOF_SEARCH,
@@ -145,6 +147,82 @@ class OneClassSVMDetector:
         path = path or MODELS_DIR / "ocsvm.pkl"
         self.model = joblib.load(path)
         return self
+
+
+class HDBSCANDetector:
+    """HDBSCAN-based anomaly detector using sklearn's built-in implementation.
+
+    HDBSCAN finds arbitrarily-shaped clusters and labels every point that doesn't
+    fit into any cluster as noise (-1). Noise points are our anomaly candidates.
+
+    sklearn's HDBSCAN is transductive — it only labels the data it was trained on.
+    For scoring NEW data (val/test sets with injected anomalies) we use a KNN
+    approximation:
+      1. After fitting, store each training point's cluster membership probability
+         (0 = noise/anomaly, >0 = cluster member/normal)
+      2. For a new point, find its k nearest training neighbors
+      3. Average their membership probabilities → anomaly_score = 1 − avg_prob
+         (score near 0 = surrounded by cluster members = normal)
+         (score near 1 = surrounded by noise points = anomaly)
+    This gives a smooth, calibrated score without needing the standalone hdbscan package.
+    """
+
+    def __init__(self, min_cluster_size: int = 15, min_samples: int = 5, contamination: float = 0.05):
+        self.min_cluster_size = min_cluster_size
+        self.min_samples      = min_samples
+        self.contamination    = contamination
+        self.name             = "HDBSCAN"
+
+    def fit(self, X: np.ndarray) -> "HDBSCANDetector":
+        from sklearn.cluster import HDBSCAN
+        from sklearn.neighbors import NearestNeighbors
+
+        # copy=True suppresses sklearn's FutureWarning about default changing in 1.10
+        self._hdb = HDBSCAN(
+            min_cluster_size=self.min_cluster_size,
+            min_samples=self.min_samples,
+            copy=True,
+        )
+        self._hdb.fit(X)
+
+        # probabilities_: 0 for noise points, >0 for cluster members.
+        # This is our proxy for "how normal is this player" — low probability = anomaly.
+        self._train_probs = self._hdb.probabilities_.copy()
+
+        # Edge case: if HDBSCAN found NO clusters at all (too few points or too sparse
+        # in feature space), all probabilities are 0 and all scores become 1.0.
+        # In that case, fall back to a flat score and rely on the strict > threshold
+        # so we don't flag everyone. This mainly affects the small 1k-player dataset;
+        # on the 28k-player Lichess data, HDBSCAN always finds meaningful clusters.
+        self._all_noise = bool(self._train_probs.max() == 0.0)
+        if self._all_noise:
+            logger.warning(
+                "HDBSCAN found no clusters (all points labeled noise). "
+                "Consider reducing min_cluster_size. Scores will be uniform."
+            )
+
+        # KNN for approximating scores on new (unseen) data.
+        # We use min_samples neighbors to stay consistent with HDBSCAN's own core-point definition.
+        k = min(self.min_samples, len(X))
+        self._knn = NearestNeighbors(n_neighbors=k).fit(X)
+
+        # Set threshold: score must STRICTLY EXCEED this to be flagged.
+        # Using strict > means the all-noise degenerate case flags 0% instead of 100%.
+        train_scores = 1.0 - self._train_probs
+        self._threshold = float(np.percentile(train_scores, 100 * (1 - self.contamination)))
+        return self
+
+    def score(self, X: np.ndarray) -> np.ndarray:
+        """Higher score = more anomalous (range roughly 0–1)."""
+        _, idx = self._knn.kneighbors(np.asarray(X))
+        # Average the membership probability of k nearest training neighbors.
+        neighbor_probs = self._train_probs[idx].mean(axis=1)
+        return 1.0 - neighbor_probs
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Returns -1 (anomaly) or 1 (normal). Uses strict > so degenerate all-noise
+        case doesn't flag every single player."""
+        return np.where(self.score(X) > self._threshold, -1, 1)
 
 
 class _AutoencoderNet(nn.Module):
@@ -332,6 +410,7 @@ def run_hyperparameter_search(
         "IsolationForest": ISOLATION_FOREST_SEARCH,
         "OneClassSVM":     OCSVM_SEARCH,
         "LOF":             LOF_SEARCH,
+        "HDBSCAN":         HDBSCAN_SEARCH,  # similar cost to LOF — KNN fit is fast
     }
 
     def _build(name: str, params: dict):
@@ -341,6 +420,8 @@ def run_hyperparameter_search(
             return OneClassSVMDetector(**params)
         if name == "LOF":
             return LOFDetector(**params)
+        if name == "HDBSCAN":
+            return HDBSCANDetector(**params)
         raise ValueError(f"Unknown model: {name}")
 
     for model_name, space in fast_spaces.items():
@@ -468,6 +549,7 @@ def run_all_models(
             input_dim=X.shape[1],
             **params.get("Autoencoder", {}),
         ),
+        HDBSCANDetector(**params.get("HDBSCAN", HDBSCAN_PARAMS)),
     ]
 
     for m in model_list:
@@ -476,9 +558,36 @@ def run_all_models(
         results[f"{m.name}_score"] = m.score(X)
         results[f"{m.name}_label"] = m.predict(X)
 
-    # Ensemble vote: flag players where ≥ 2 of the three advanced models agree
-    advanced = ["IsolationForest", "OneClassSVM", "Autoencoder"]
-    label_cols = [f"{n}_label" for n in advanced]
-    results["anomaly_votes"] = (results[label_cols] == -1).sum(axis=1)
-    results["ensemble_anomaly"] = results["anomaly_votes"] >= 2
+    # ── Ensemble voting — strong models only ─────────────────────────────────
+    # We ran overlap analysis on the full results to decide who gets a vote.
+    # Short version: only LOF, Autoencoder, and OneClassSVM make it in.
+    #
+    # Why we dropped the others:
+    #   - HDBSCAN: flags 0 players on this dataset (threshold never crossed).
+    #     Its scores have some ranking power (AUC 0.67) but it contributes
+    #     zero votes in practice. Kept in results/ for reporting, not voting.
+    #   - IsolationForest: AUC 0.72. Has 882 "unique" catches that LOF/AE miss,
+    #     but at that accuracy level those are almost certainly false positives,
+    #     not real anomalies the good models overlooked.
+    #   - ZScoreBaseline: AUC 0.76, 491 unique catches, same reasoning as IF.
+    #     It's a useful sanity check but shouldn't drive ensemble decisions.
+    #
+    # The three voters:
+    #   LOF          — AUC 0.957, density-based, best at catching subtle outliers
+    #   Autoencoder  — AUC 0.959, reconstruction-based, complements LOF well
+    #                  (they agree only ~26-35% of the time, so they're genuinely
+    #                  looking at different things)
+    #   OneClassSVM  — AUC 0.842, margin-based, adds a third perspective
+    #                  with 159 unique catches not found by LOF or AE
+    #
+    # Flag logic: majority vote (≥2 of 3).
+    # All 6 model scores/labels are still stored in the CSV so nothing is hidden.
+    ENSEMBLE_VOTERS = ["LOF", "Autoencoder", "OneClassSVM"]
+    voter_label_cols = [f"{n}_label" for n in ENSEMBLE_VOTERS if f"{n}_label" in results.columns]
+    results["anomaly_votes"] = (results[voter_label_cols] == -1).sum(axis=1)
+
+    # ≥2/3 majority — high recall triage list (players worth a second look)
+    results["ensemble_flag"]      = results["anomaly_votes"] >= 2
+    # All 3 agree — high precision shortlist (players most likely to be anomalous)
+    results["ensemble_confident"] = results["anomaly_votes"] == 3
     return results

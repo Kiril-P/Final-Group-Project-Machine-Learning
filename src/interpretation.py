@@ -102,7 +102,9 @@ def analyze_false_positives(
     player_df: pd.DataFrame,
 ) -> pd.DataFrame:
     """Heuristic explanations for ensemble-flagged players."""
-    anomalies = results[results["ensemble_anomaly"] == True].copy()
+    # Use ensemble_flag (≥2 models agree) — replaces the old single ensemble_anomaly column.
+    # ensemble_confident (≥4 models agree) is stricter; flag is the right level for FP analysis.
+    anomalies = results[results["ensemble_flag"] == True].copy()
     explanations = []
     for _, row in anomalies.iterrows():
         player_games = player_df[player_df["player_id"] == row["player_id"]]
@@ -292,6 +294,266 @@ def plot_learning_curves(
     plt.show()
 
     return df
+
+
+def generate_player_explanations(
+    results: pd.DataFrame,
+    agg: pd.DataFrame,
+    feature_names: list,
+    top_n: int = 3,
+) -> pd.DataFrame:
+    """
+    For every ensemble-flagged player, explain which features drove the flag
+    and how confident we are in that explanation.
+
+    We only claim to "know" why a player was flagged when a feature has a clear,
+    intuitive cheating interpretation AND the player's value is extreme in the
+    suspicious direction. For everything else we say it's model-detected but not
+    directly interpretable — no fake certainty.
+
+    Args:
+        results:      Output of run_all_models — one row per player, includes
+                      ensemble_flag, ensemble_confident, anomaly_votes.
+        agg:          Full player feature DataFrame (player_features.csv).
+                      Used to compute within-band z-scores for explanations.
+        feature_names: Features that went into the model (in order).
+        top_n:        How many top-deviating features to report per player.
+
+    Returns:
+        DataFrame with one row per flagged player, columns:
+        player_id, avg_rating, rating_band, n_games, anomaly_votes,
+        ensemble_confident, top_feature_{1..n}, z_score_{1..n},
+        explanation_{1..n}, confident_{1..n}, summary.
+    """
+    # ── Which direction is suspicious for each feature ────────────────────────
+    # "high" = unusually high value is the red flag
+    # "low"  = unusually low value is the red flag
+    # None   = either direction is flagged — explanation is model-based
+    FEATURE_META = {
+        "avg_acpl_band_z": {
+            "direction": "low",
+            "text": (
+                "ACPL is unusually low for their rating band — "
+                "plays with near engine-level accuracy relative to peers at the same Elo"
+            ),
+            "confident": True,
+        },
+        "avg_acpl": {
+            "direction": "low",
+            "text": (
+                "ACPL is unusually low overall — plays with high accuracy "
+                "(note: not adjusted for rating band)"
+            ),
+            "confident": True,
+        },
+        "best_move_rate_band_z": {
+            "direction": "high",
+            "text": (
+                "Finds optimal moves at an unusually high rate for their rating band — "
+                "engines consistently find the best move; humans at this Elo don't"
+            ),
+            "confident": True,
+        },
+        "best_move_rate": {
+            "direction": "high",
+            "text": (
+                "Finds optimal moves at an unusually high rate overall "
+                "(note: not adjusted for rating band)"
+            ),
+            "confident": True,
+        },
+        "win_rate_vs_expected": {
+            "direction": "high",
+            "text": (
+                "Consistently outperforms their Elo prediction — "
+                "wins more games than the rating system expects given their opponents"
+            ),
+            "confident": True,
+        },
+        "performance_vs_actual": {
+            "direction": "high",
+            "text": (
+                "Empirical performance rating is significantly higher than their official Elo — "
+                "they play measurably better than their registered rating suggests"
+            ),
+            "confident": True,
+        },
+        "underdog_win_rate": {
+            "direction": "high",
+            "text": (
+                "Wins against much stronger opponents (100+ Elo higher) at an unusual rate — "
+                "for a human this is statistically improbable over many games"
+            ),
+            "confident": True,
+        },
+        "comeback_rate": {
+            "direction": "high",
+            "text": (
+                "Escapes clearly losing positions (eval < -1.5 pawns) at an unusual rate — "
+                "this is extremely hard for humans but routine for engines"
+            ),
+            "confident": True,
+        },
+        "time_pressure_rate": {
+            "direction": "low",
+            "text": (
+                "Rarely runs into time trouble — engine users don't spend real time thinking, "
+                "so they almost never run low on the clock"
+            ),
+            "confident": True,
+        },
+        "blunder_rate": {
+            "direction": "low",
+            "text": (
+                "Unusually few blunders — engines almost never drop pieces or miss tactics; "
+                "blunder rate is roughly Elo-independent so this is meaningful at any rating"
+            ),
+            "confident": True,
+        },
+        "rating_volatility": {
+            "direction": "high",
+            "text": (
+                "Rating changes erratically — could indicate sandbagging "
+                "(deliberately losing to lower rating) or a new account climbing quickly"
+            ),
+            "confident": True,
+        },
+        # The features below are statistically anomalous but harder to interpret cleanly.
+        # We report them honestly as model-detected rather than making up an explanation.
+        "win_rate": {
+            "direction": "high",
+            "text": (
+                "Win rate is unusually high — in a stable Elo system win rates "
+                "converge toward ~50%, so sustained deviation is notable"
+            ),
+            "confident": False,
+        },
+        "avg_turns": {
+            "direction": None,
+            "text": (
+                "Unusual game length distribution — "
+                "flagged by the statistical model but no single clear interpretation"
+            ),
+            "confident": False,
+        },
+        "opening_ply_ratio": {
+            "direction": None,
+            "text": (
+                "Unusual opening depth relative to rating — "
+                "flagged by the model; not a strong standalone cheating signal"
+            ),
+            "confident": False,
+        },
+        "victory_efficiency": {
+            "direction": None,
+            "text": (
+                "Unusual game outcome efficiency — "
+                "flagged by the model; interpretation is not straightforward"
+            ),
+            "confident": False,
+        },
+        "move_time_cv": {
+            "direction": "low",
+            "text": (
+                "Unusually uniform move times — "
+                "engine users think for the same amount of time every move (low variation)"
+            ),
+            "confident": True,
+        },
+    }
+
+    flagged = results[results["ensemble_flag"] == True].copy()
+    if flagged.empty:
+        logger.warning("No ensemble-flagged players found — explanation CSV will be empty.")
+        return pd.DataFrame()
+
+    # Join with full player features to get raw feature values
+    feat_cols = [c for c in feature_names if c in agg.columns]
+    agg_sub = agg[["player_id", "rating_band"] + feat_cols].copy()
+    flagged = flagged.merge(agg_sub, on="player_id", how="left", suffixes=("", "_feat"))
+
+    # ── Compute within-band z-scores for all features using full population ───
+    # We use the entire agg population (not just train) because we're computing
+    # "how unusual is this player relative to all players at their rating?" —
+    # a contextual normalisation, not a learned model parameter.
+    band_means = agg.groupby("rating_band", observed=False)[feat_cols].mean()
+    band_stds  = agg.groupby("rating_band", observed=False)[feat_cols].std().fillna(1.0).replace(0, 1.0)
+
+    rows = []
+    for _, player in flagged.iterrows():
+        band = player.get("rating_band")
+        row: dict = {
+            "player_id":          player["player_id"],
+            "avg_rating":         round(float(player["avg_rating"]), 0),
+            "rating_band":        str(band),
+            "n_games":            int(player["n_games"]),
+            "anomaly_votes":      int(player["anomaly_votes"]),
+            "ensemble_confident": bool(player["ensemble_confident"]),
+        }
+
+        # Compute suspiciousness score for each feature (signed z-score in suspicious direction)
+        feat_scores = {}
+        for feat in feat_cols:
+            val = player.get(feat)
+            if pd.isna(val):
+                continue
+            meta = FEATURE_META.get(feat, {"direction": None, "text": "Model-detected anomaly — no direct interpretation.", "confident": False})
+            try:
+                b_mean = float(band_means.loc[band, feat]) if band in band_means.index else float(agg[feat].mean())
+                b_std  = float(band_stds.loc[band, feat])  if band in band_stds.index  else float(max(agg[feat].std(), 1e-8))
+            except Exception:
+                continue
+            z = (float(val) - b_mean) / b_std
+
+            # Flip sign so that the "suspicious direction" always gives a positive score
+            if meta["direction"] == "high":
+                score = z          # high value is suspicious → high z = high score
+            elif meta["direction"] == "low":
+                score = -z         # low value is suspicious → negative z flipped = high score
+            else:
+                score = abs(z)     # either direction — use magnitude
+
+            feat_scores[feat] = (score, z, meta)
+
+        # Sort by suspiciousness score, take top_n
+        top = sorted(feat_scores.items(), key=lambda x: x[1][0], reverse=True)[:top_n]
+
+        any_confident = False
+        for rank, (feat, (score, z, meta)) in enumerate(top, start=1):
+            row[f"top_feature_{rank}"]   = feat
+            row[f"z_score_{rank}"]       = round(z, 2)
+            row[f"explanation_{rank}"]   = meta["text"]
+            row[f"confident_{rank}"]     = meta["confident"]
+            if meta["confident"]:
+                any_confident = True
+
+        # Summary: if we have confident signals, name them; otherwise be honest
+        if not top:
+            row["summary"] = "Flagged by statistical model — no individual feature stands out clearly."
+        elif any_confident:
+            top_readable = [
+                t[0].replace("_band_z", " (band-normalised)").replace("_", " ")
+                for t in top if t[1][2]["confident"]
+            ]
+            row["summary"] = (
+                f"Flagged primarily due to: {', '.join(top_readable[:2])}. "
+                f"{'All 3 voters agreed.' if player['ensemble_confident'] else '2 of 3 voters agreed.'}"
+            )
+        else:
+            row["summary"] = (
+                "Flagged by statistical model — top deviating features are not directly "
+                "interpretable as cheating signals. Warrants human review."
+            )
+
+        rows.append(row)
+
+    out = pd.DataFrame(rows)
+    logger.info(
+        "Player explanations generated for %s flagged players (%s with confident signals).",
+        len(out),
+        out.get("confident_1", pd.Series(dtype=bool)).sum() if "confident_1" in out.columns else "?",
+    )
+    return out
 
 
 def plot_feature_importance(importance_df: pd.DataFrame, save: bool = True) -> None:

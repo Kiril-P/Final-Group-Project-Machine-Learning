@@ -153,6 +153,27 @@ LOF_SEARCH: dict = {
     "n_neighbors":   [10, 15, 20, 30, 40],
 }
 
+# HDBSCAN finds clusters of arbitrary shape and marks everything outside as noise.
+# No contamination parameter needed for the algorithm itself — we only use it to
+# set our anomaly score threshold after fitting.
+HDBSCAN_PARAMS = {
+    "min_cluster_size": 15,    # minimum points to form a cluster
+    "min_samples":      5,     # how many neighbors define a core point
+    "contamination":    CONTAMINATION,
+}
+
+HDBSCAN_SEARCH: dict = {
+    # min_cluster_size is the main knob: smaller = more sensitive (more anomalies flagged),
+    # larger = more conservative. We search a wide range since optimal value depends on
+    # how dense the normal player population is in feature space.
+    "min_cluster_size": [10, 15, 20, 30, 50],
+    # min_samples controls how strict the core-point definition is.
+    # Higher = tighter clusters, more noise points = more anomalies.
+    "min_samples":      [5, 10, 15],
+    # contamination: only affects our score threshold, not the HDBSCAN algorithm.
+    "contamination":    [0.03, 0.05, 0.08, 0.10],
+}
+
 # Autoencoder search is split: we first run cheap 30-epoch trials to find the best
 # encoding_dim and threshold percentile, then re-train the winner at full epochs.
 # This keeps total search cost manageable without sacrificing architecture quality.

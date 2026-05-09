@@ -23,6 +23,7 @@ from src.lichess_loader import load_and_prepare_lichess
 from src.features import aggregate_player_stats, add_engineered_features, get_feature_matrix
 from src.interpretation import (
     analyze_false_positives,
+    generate_player_explanations,
     permutation_feature_importance,
     plot_anomaly_score_distribution,
     plot_feature_importance,
@@ -31,6 +32,7 @@ from src.interpretation import (
 )
 from src.models import (
     AutoencoderDetector,
+    HDBSCANDetector,
     IsolationForestDetector,
     LOFDetector,
     OneClassSVMDetector,
@@ -208,6 +210,8 @@ def main(
              OneClassSVMDetector(**p), "OneClassSVM"),
         (lambda p=best_params.get("Autoencoder", {}):
              AutoencoderDetector(input_dim=X_train.shape[1], **p), "Autoencoder"),
+        (lambda p=best_params.get("HDBSCAN", {"min_cluster_size": 15}):
+             HDBSCANDetector(**p), "HDBSCAN"),
     ]
 
     # Stage 4a: Validation set evaluation (used for model comparison / selection)
@@ -302,6 +306,21 @@ def main(
     logger.info("Stage 7: Failure mode analysis...")
     failure_df = analyze_false_positives(meta_train, results, player_df)
     failure_df.to_csv(RESULTS_DIR / "failure_analysis.csv", index=False)
+
+    # Stage 7b: Per-player explainability for all ensemble-flagged players.
+    # For each flagged player we report which features deviated most and in which
+    # direction, with honest language about what we do and don't know.
+    # Features with a clear cheating interpretation get a plain-English explanation;
+    # features that are statistically anomalous but ambiguous are marked as
+    # "model-detected" rather than inventing a reason.
+    logger.info("Stage 7b: Generating per-player explanations...")
+    explanations_df = generate_player_explanations(results, agg, feature_names)
+    explanations_df.to_csv(RESULTS_DIR / "player_explanations.csv", index=False)
+    logger.info(
+        "Explanations saved for %s flagged players → %s",
+        len(explanations_df),
+        RESULTS_DIR / "player_explanations.csv",
+    )
 
     logger.info("Pipeline complete. Outputs in %s", RESULTS_DIR)
     return results, importance_df, injection_results

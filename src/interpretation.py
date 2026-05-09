@@ -460,6 +460,53 @@ def generate_player_explanations(
             ),
             "confident": True,
         },
+        # Per-phase ACPL features
+        "avg_acpl_middlegame_band_z": {
+            "direction": "low",
+            "text": (
+                "Middlegame ACPL is unusually low for their rating band — "
+                "the middlegame is where engine assistance matters most; "
+                "human players naturally make more mistakes in complex positions"
+            ),
+            "confident": True,
+        },
+        "avg_acpl_opening_band_z": {
+            "direction": "low",
+            "text": (
+                "Opening ACPL is unusually low for their rating band — "
+                "could reflect strong opening preparation rather than engine use; "
+                "weaker signal than middlegame ACPL"
+            ),
+            "confident": False,  # opening accuracy is often explained by preparation
+        },
+        "avg_acpl_endgame_band_z": {
+            "direction": "low",
+            "text": (
+                "Endgame ACPL is unusually low for their rating band — "
+                "engines play endgames with near-perfect technique"
+            ),
+            "confident": True,
+        },
+        "acpl_phase_gap_band_z": {
+            "direction": "high",
+            "text": (
+                "Large gap between opening and middlegame accuracy — "
+                "plays at roughly human level in the opening, then dramatically "
+                "better in the middlegame; consistent with turning on an engine "
+                "once the position moves beyond memorised theory"
+            ),
+            "confident": True,
+        },
+        "acpl_consistency_band_z": {
+            "direction": "low",
+            "text": (
+                "Move quality is unusually consistent across games for their rating band — "
+                "humans have good days and bad days; an engine plays at the same "
+                "level every game regardless of tiredness, preparation, or time pressure. "
+                "Suspiciously low game-to-game ACPL variance relative to peers at the same Elo."
+            ),
+            "confident": True,
+        },
     }
 
     flagged = results[results["ensemble_flag"] == True].copy()

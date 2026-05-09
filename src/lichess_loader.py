@@ -151,20 +151,27 @@ def _compute_player_eval_stats(
                       (Black wants eval to go DOWN; if it goes up, Black lost ground)
 
     "Was losing": any point where eval favoured the opponent by > 150 cp.
-    "Blunder": loss ≥ 150 cp on a single move.
-    "Best move": loss ≤ 10 cp (essentially no error).
+    "Blunder": loss >= 150 cp on a single move.
+    "Best move": loss <= 10 cp (essentially no error).
+
+    Per-phase ACPL: losses split into opening (moves 1-10), middlegame (11-30),
+    endgame (31+). The cheating signal is typically strongest in the middlegame —
+    a player who looks human in the opening then plays engine-perfect once
+    positions get complex is a classic pattern. NaN if too few moves in a phase.
     """
     if not all_evals:
         return {
             "avg_acpl_game": np.nan, "blunder_count": 0,
             "best_move_count": 0, "n_moves_with_eval": 0, "was_losing": False,
+            "acpl_opening_game": np.nan, "acpl_middlegame_game": np.nan,
+            "acpl_endgame_game": np.nan,
         }
 
     losses: List[float] = []
     was_losing = False
 
     if player_color == "white":
-        # Iterate over White's eval indices: 0, 2, 4, …
+        # Iterate over White's eval indices: 0, 2, 4, ...
         for i, idx_after in enumerate(range(0, len(all_evals), 2)):
             idx_before = idx_after - 1  # Black's previous move (negative for first)
             e_after  = all_evals[idx_after]
@@ -173,7 +180,7 @@ def _compute_player_eval_stats(
             if e_before <= -150:          # White was losing before this move
                 was_losing = True
     else:
-        # Iterate over Black's eval indices: 1, 3, 5, …
+        # Iterate over Black's eval indices: 1, 3, 5, ...
         for idx_before in range(0, len(all_evals) - 1, 2):
             idx_after = idx_before + 1
             if idx_after >= len(all_evals):
@@ -185,12 +192,25 @@ def _compute_player_eval_stats(
                 was_losing = True
 
     n = len(losses)
+
+    # ── Per-phase ACPL ────────────────────────────────────────────────────────
+    # losses[i] maps directly to the player's (i+1)th move, so slicing gives phases.
+    # Require at least 3 moves per phase for a meaningful average.
+    _MIN_PHASE = 3
+
+    def _phase_acpl(sliced: list) -> float:
+        return float(np.mean(sliced)) if len(sliced) >= _MIN_PHASE else np.nan
+
     return {
-        "avg_acpl_game":    float(np.mean(losses)) if losses else np.nan,
-        "blunder_count":    int(sum(1 for x in losses if x >= 150)),
-        "best_move_count":  int(sum(1 for x in losses if x <= 10)),
-        "n_moves_with_eval": n,
-        "was_losing":       bool(was_losing),
+        "avg_acpl_game":         float(np.mean(losses)) if losses else np.nan,
+        "blunder_count":         int(sum(1 for x in losses if x >= 150)),
+        "best_move_count":       int(sum(1 for x in losses if x <= 10)),
+        "n_moves_with_eval":     n,
+        "was_losing":            bool(was_losing),
+        # Phase breakdown — key for detecting engine use that only starts mid-game
+        "acpl_opening_game":     _phase_acpl(losses[:10]),    # player moves 1-10
+        "acpl_middlegame_game":  _phase_acpl(losses[10:30]),  # player moves 11-30
+        "acpl_endgame_game":     _phase_acpl(losses[30:]),    # player moves 31+
     }
 
 

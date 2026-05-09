@@ -86,11 +86,22 @@ def aggregate_player_stats(player_df: pd.DataFrame) -> pd.DataFrame:
 
     # ── Optional eval columns (large Lichess dataset only) ────────────────────
     for src_col, agg_name, func in [
-        ("avg_acpl_game",    "avg_acpl",               "mean"),
-        ("blunder_count",    "total_blunders",          "sum"),
-        ("best_move_count",  "total_best_moves",        "sum"),
-        ("n_moves_with_eval","total_moves_with_eval",   "sum"),
-        ("was_losing",       "was_losing_count",        "sum"),
+        ("avg_acpl_game",       "avg_acpl",              "mean"),
+        ("blunder_count",       "total_blunders",         "sum"),
+        ("best_move_count",     "total_best_moves",       "sum"),
+        ("n_moves_with_eval",   "total_moves_with_eval",  "sum"),
+        ("was_losing",          "was_losing_count",       "sum"),
+        # Per-phase ACPL — average across all a player's games for each phase
+        ("acpl_opening_game",   "avg_acpl_opening",       "mean"),
+        ("acpl_middlegame_game","avg_acpl_middlegame",     "mean"),
+        ("acpl_endgame_game",   "avg_acpl_endgame",        "mean"),
+        # ACPL consistency: std of avg_acpl_game across all a player's games.
+        # An engine is unnaturally consistent — ACPL barely varies game to game.
+        # A human has good days and bad days, so their std is naturally higher.
+        # Note: needs at least ~10 games to be a reliable estimate; with only 5 games
+        # (our minimum) the std is noisy. We include it anyway and let the ensemble
+        # absorb the noise from low-game-count players.
+        ("avg_acpl_game",       "acpl_consistency",        "std"),
     ]:
         if src_col in df.columns:
             agg_spec[agg_name] = (src_col, func)
@@ -215,8 +226,22 @@ def add_engineered_features(agg: pd.DataFrame) -> pd.DataFrame:
     # here — these are "contextual" statistics (what's normal for a 1400-rated player?)
     # rather than learned model parameters, so using all data doesn't cause leakage.
     for raw_feat, z_feat in [
-        ("avg_acpl",        "avg_acpl_band_z"),
-        ("best_move_rate",  "best_move_rate_band_z"),
+        ("avg_acpl",            "avg_acpl_band_z"),
+        ("best_move_rate",      "best_move_rate_band_z"),
+        # Per-phase ACPL — each phase compared within rating band.
+        # Middlegame is the key signal: engines get turned on when positions get complex.
+        # Opening is less informative (cheaters often play theory normally).
+        # Endgame is informative but many games end before move 30, so coverage is lower.
+        ("avg_acpl_opening",    "avg_acpl_opening_band_z"),
+        ("avg_acpl_middlegame", "avg_acpl_middlegame_band_z"),
+        ("avg_acpl_endgame",    "avg_acpl_endgame_band_z"),
+        # ACPL consistency — also band-normalized.
+        # The user's insight: higher-rated players are naturally more consistent
+        # (lower STDCPL) because their skill floor is higher. A 2200 player
+        # fluctuates between ACPL 20-35; a 1200 might fluctuate 50-120. Without
+        # band normalization we'd flag high-rated players as suspicious just for
+        # being good, which is wrong. Comparing within band makes the signal fair.
+        ("acpl_consistency",    "acpl_consistency_band_z"),
     ]:
         if raw_feat in df.columns and "rating_band" in df.columns:
             df[z_feat] = np.nan
@@ -233,6 +258,42 @@ def add_engineered_features(agg: pd.DataFrame) -> pd.DataFrame:
             n_computed = df[z_feat].notna().sum()
             logger.info(
                 "Within-band z-score '%s' computed for %s players", z_feat, n_computed
+            )
+
+    # ── Phase gap: opening ACPL minus middlegame ACPL ─────────────────────────
+    # This is the single most powerful phase-based signal. A player who plays
+    # normally (high ACPL) in the opening but suspiciously well (low ACPL) in the
+    # middlegame has a large positive gap. That's the classic pattern of someone
+    # who knows their opening theory but turns on an engine once the position
+    # gets complicated.
+    #
+    # A genuine strong player also has lower middlegame ACPL than opening, but
+    # the gap is proportionally smaller — they're consistent throughout.
+    # We band-normalize the gap because the absolute ACPL values (and thus the
+    # gap magnitude) both scale with Elo — at 1200 ACPL values are larger so the
+    # raw gap would be bigger even without cheating.
+    if "avg_acpl_opening" in df.columns and "avg_acpl_middlegame" in df.columns:
+        df["acpl_phase_gap"] = (
+            df["avg_acpl_opening"] - df["avg_acpl_middlegame"]
+        )
+        # Band-normalize the gap
+        if "rating_band" in df.columns:
+            df["acpl_phase_gap_band_z"] = np.nan
+            for band in df["rating_band"].dropna().unique():
+                mask = df["rating_band"] == band
+                col = df.loc[mask, "acpl_phase_gap"].dropna()
+                if len(col) < 2:
+                    continue
+                mean, std = float(col.mean()), float(col.std())
+                if std > 0:
+                    df.loc[mask, "acpl_phase_gap_band_z"] = (
+                        df.loc[mask, "acpl_phase_gap"] - mean
+                    ) / std
+                else:
+                    df.loc[mask, "acpl_phase_gap_band_z"] = 0.0
+            logger.info(
+                "Phase gap feature 'acpl_phase_gap_band_z' computed for %s players",
+                df["acpl_phase_gap_band_z"].notna().sum(),
             )
 
     logger.info("Engineered features added. Shape: %s", df.shape)
@@ -299,12 +360,21 @@ def get_feature_matrix(
     # those players from the model entirely, which is worse than not having the feature.
     if feature_set == "extended":
         extended_candidates = [
-            "move_time_cv",           # strongest cheating signal — uniform think times
-            "time_pressure_rate",     # engine users don't run out of time
-            "avg_acpl_band_z",        # ACPL z-score within rating band (see features.py)
-            "blunder_rate",           # engines almost never blunder (Elo-independent)
-            "best_move_rate_band_z",  # best-move rate z-score within rating band
-            "comeback_rate",          # engines escape losing positions at superhuman rates
+            "move_time_cv",                  # strongest cheating signal — uniform think times
+            "time_pressure_rate",            # engine users don't run out of time
+            "avg_acpl_band_z",               # overall ACPL z-score within rating band
+            "blunder_rate",                  # engines almost never blunder (Elo-independent)
+            "best_move_rate_band_z",         # best-move rate z-score within rating band
+            "comeback_rate",                 # engines escape losing positions at superhuman rates
+            # Per-phase ACPL — finer-grained than overall ACPL.
+            # Most useful for detecting "mid-game engine activation" patterns.
+            "avg_acpl_middlegame_band_z",    # middlegame ACPL vs band peers (strongest phase signal)
+            "avg_acpl_opening_band_z",       # opening ACPL vs band peers (lower signal, theory-heavy)
+            "avg_acpl_endgame_band_z",       # endgame ACPL vs band peers (lower coverage — many games end earlier)
+            "acpl_phase_gap_band_z",         # opening minus middlegame ACPL, band-normalized
+                                             # large positive = normal opening, engine-perfect middlegame
+            "acpl_consistency_band_z",       # std of ACPL across games, band-normalized
+                                             # unusually LOW = suspiciously consistent = engine-like
         ]
         for feat in extended_candidates:
             if feat in df.columns:

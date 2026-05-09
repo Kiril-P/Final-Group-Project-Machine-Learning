@@ -247,3 +247,145 @@ avg_turns, opening_ply_ratio, victory_efficiency, win_rate (alone, without conte
 top 3 signals, their z-scores, explanations, and a plain-English summary.
 
 ---
+
+## 13. ACPL consistency across games (STDCPL), band-normalized
+
+**What it is:** The standard deviation of `avg_acpl_game` across all of a player's
+games — how much their move quality varies from game to game.
+
+**The signal:** An engine is unnaturally consistent. It plays at roughly the same
+level every game regardless of the position, the opponent, or how tired the human
+behind the keyboard is. A genuine human has good days and bad days — their ACPL
+varies noticeably across games. Unusually low STDCPL for a player's rating band is
+therefore suspicious.
+
+**Why band normalization is necessary here too (user's insight):** Higher-rated
+players are naturally more consistent than lower-rated ones — their skill floor is
+higher so there's less room to fluctuate. A 2200 player might vary between ACPL 20-35
+across games; a 1200 player might vary between 50-120. Without band normalization
+we'd flag strong players as suspicious just for being consistently good, which is
+wrong. Comparing within band makes the signal meaningful.
+
+**One caveat:** The std estimate needs enough games to be reliable. With our minimum
+of 5 games per player it can be noisy. We include it and let the ensemble absorb
+the noise — a single noisy feature doesn't break LOF or the Autoencoder.
+
+**Feature name:** `acpl_consistency_band_z` (suspicious direction: unusually LOW).
+
+---
+
+## 15. Per-game-phase ACPL: opening / middlegame / endgame split
+
+**Why:** Both Chess.com and Lichess look at accuracy broken down by game phase, not
+just as a flat average. A flat avg_acpl can miss the most common cheating pattern:
+a player who uses theory in the opening (so their opening accuracy looks normal)
+and then turns on the engine once the position gets complicated.
+
+Splitting into three phases gives us two new signals:
+- **Middlegame ACPL** (moves 11-30): where engine assistance matters most. Positions
+  are complex and unique — a human makes mistakes here, an engine doesn't.
+- **Phase gap** (opening ACPL − middlegame ACPL): if this is unusually large for
+  a player's rating band, they're playing at human level in theory and engine level
+  once theory runs out. That's the clearest behavioral signature of mid-game cheating.
+
+**Why opening ACPL is a weaker signal:** Opening moves are heavily memorised. A
+dedicated player who has studied their opening lines can have very low opening ACPL
+without any engine help. We include it in the feature set but mark it as lower
+confidence in the explainability output.
+
+**Phase boundaries:** moves 1-10 (opening), 11-30 (middlegame), 31+ (endgame).
+Standard thresholds used in academic chess analysis literature.
+NaN for any phase with fewer than 3 player moves — avoids misleading averages
+from games that ended very early.
+
+**Band normalization:** all three phase ACPL values and the phase gap are normalized
+within rating bands, for the same reasons as overall avg_acpl (see decision #11).
+
+---
+
+## Future Work — What We Would Do With More Time or Data
+
+These are things we identified, thought through, and consciously decided not to
+implement — not because they aren't valuable, but because of data or time constraints.
+Documenting them here rather than just leaving them out.
+
+---
+
+### F1. Move-time features (per-move clock data)
+
+**What it is:** The coefficient of variation of per-move think times (std / mean).
+An engine responds almost instantly to every position, so its "think time" per move
+is just the time spent waiting + clicking — nearly constant. A human varies a lot:
+fast on forcing lines, long on critical decisions. Low move-time CV = suspiciously
+robotic pacing.
+
+**Why we don't have it:** The Lichess July 2016 export has no `[%clk ...]` clock
+annotations in the move text. Clock annotations only appear in Lichess exports from
+roughly mid-2017 onwards. The feature is fully implemented in `lichess_loader.py`
+and `features.py` and will activate automatically if a dataset with clock data is used.
+
+**Impact if available:** Probably the single strongest cheating signal. Chess.com
+explicitly uses move timing as a primary detection factor.
+
+---
+
+### F2. Move sequence pattern modeling (LSTM / transformer)
+
+**What it is:** Rather than aggregating features at the player level, model the
+*sequence* of moves directly. Engines don't just make good moves — they make moves
+in a recognisably algorithmic order. Lichess's Irwin system uses a neural network on
+move sequences for exactly this reason.
+
+**Why we didn't implement it:** Requires per-game sequence data going into a model,
+not per-player aggregated statistics. This is a fundamentally different architecture
+— a sequence model on top of our current pipeline, not an extension of it. Significant
+scope increase with real risk of not finishing before the deadline.
+
+**What would be needed:** Parse each game into a sequence of (move quality, position
+complexity, eval delta) tuples, feed into an LSTM or transformer, train on labeled
+data (or use contrastive self-supervised learning). Ground-truth labels remain the
+hard problem.
+
+---
+
+### F3. Opening deviation analysis
+
+**What it is:** Track where each player deviates from known opening theory (e.g.
+from an ECO database), and measure how their accuracy *drops off* after the deviation
+point. A strong player deviates from theory into known good alternatives — their
+accuracy stays high. An engine user's accuracy stays high indefinitely because the
+engine handles any position. A genuine beginner's accuracy drops sharply after
+deviation because they're improvising.
+
+**Why we didn't implement it:** Requires an opening database (e.g. Lichess opening
+explorer) to look up move novelty points. Not in our current dataset.
+
+---
+
+### F4. Mirrored game / cheating ring detection
+
+**What it is:** Lichess catches cases where two accounts play identical or near-identical
+move sequences in the same time window — one player is consulting an engine and
+mirroring moves against a different opponent. Purely network-based detection.
+
+**Why we didn't implement it:** We're doing individual behavioral profiling, not
+cross-player network analysis. Detecting cheating rings would require building a
+game-similarity graph across all players, which is a separate project.
+
+---
+
+### F5. Account-level and device signals
+
+**What it is:** Chess.com uses over 100 factors including device fingerprinting, IP
+patterns, session behavior, tab-switching frequency, and account creation patterns.
+A brand-new account that immediately plays at a high level with suspicious behavioral
+features is far more likely to be cheating than an established account.
+
+**Why we don't have it:** None of this is in any public dataset. It's proprietary
+platform data. We could approximate it with account age (first game date) from Lichess
+data if we had the full history, but the July 2016 export doesn't include account
+creation dates.
+
+---
+
+---

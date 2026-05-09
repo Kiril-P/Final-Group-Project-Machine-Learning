@@ -6,6 +6,45 @@ Think of it as a lab notebook — the reasoning behind the code, not just the co
 
 ---
 
+## Core Limitation — Read This First
+
+**We have no ground-truth labels. There are no confirmed cheaters in our dataset.**
+
+This is the fundamental constraint of the entire project, and it shapes every decision
+we made. It is not a gap in our methodology — it is a reality of the problem domain
+that every serious chess integrity system faces.
+
+Without confirmed cheater labels, we cannot report a real precision or recall rate.
+Our AUC numbers are measured against synthetically injected anomalies that we created
+ourselves — they tell us how well the model detects the *kind* of anomaly we designed,
+not how well it would perform on actual confirmed cheaters.
+
+**What this system is:**
+A behavioral triage tool. It efficiently identifies the players most worth a human
+reviewer's attention out of a large population. It ranks statistical outliers — players
+whose aggregated behavior is unusual relative to peers at their rating level across
+multiple independent signals.
+
+**What this system is not:**
+A verdict engine. Flagging a player does not mean they are cheating. A flagged player
+could be a naturally talented outlier, someone on a hot streak, an intensive opener
+who studied their lines deeply, or simply statistical noise. The system explicitly
+labels which signals it is confident about and which are model-detected but ambiguous.
+
+**Why unsupervised is the right approach here:**
+The two alternatives — supervised learning and semi-supervised learning — both require
+labeled data. Chess.com and Lichess treat their ban lists as confidential. Lichess's
+own supervised model (Kaladin) is trained only on player confessions, which is a biased
+and incomplete label set. Given the data available to us, unsupervised anomaly detection
+with honest uncertainty reporting is not a compromise — it is the appropriate method.
+
+**This limitation is acknowledged explicitly throughout the project** — in the
+validation strategy (synthetic injection with two difficulty levels), in the ensemble
+design (triage list vs. high-confidence shortlist), in the per-player explanation
+output (confident vs. model-based signals), and in the report.
+
+---
+
 ## 1. Dataset: Lichess July 2016 (6.25M games) over the small Kaggle CSV (20k games)
 
 **What we chose:** The big Lichess dataset, sampled to 500k games → ~28k unique players.

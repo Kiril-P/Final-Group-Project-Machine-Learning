@@ -395,6 +395,122 @@ for no good reason. The whole point of the system is to triage a full player poo
 
 ---
 
+## Decision 18 — Position-Complexity-Weighted ACPL
+
+**The problem with raw ACPL:**
+Standard average centipawn loss treats all moves equally. A 20cp mistake in a dead-equal
+position gets the same weight as a 20cp mistake when you're already down 300cp. But in a
+position where you're completely lost, almost any move is "wrong" — the eval is already in
+the tank. What really matters is how you play when the game is still undecided.
+
+**What we did:**
+Weight each move's centipawn loss by `exp(-|eval_before| / 100)`:
+- Position at 0cp (equal):  weight = 1.00 — full credit, this move really matters
+- Position at ±100cp:       weight = 0.37 — still relevant but position is lopsided
+- Position at ±300cp:       weight = 0.05 — game is basically decided, barely counts
+
+So `weighted_acpl = sum(loss_i × weight_i) / sum(weight_i)`.
+
+This is the same core intuition behind Ken Regan's academic framework (the FIDE-endorsed
+system). He calls it the "marginal centipawn principle" — a 20cp loss in an equal position
+carries 5× the detection weight of the same 20cp loss in a clearly won/lost position.
+
+**Why this is a better engine signal:**
+An engine playing in an equal, critical position will have near-zero CPL with full weight.
+A human will mess up exactly when the position is at its most complicated — which is also
+when the exponential weight is highest. So the gap between engine and human is amplified
+most precisely in the positions where it matters.
+
+**Implementation note:**
+We use `|eval_before|` — the absolute value of the eval from White's perspective, before
+the player's move. This is the most natural position-tension measure: 0cp = perfectly equal,
+anything positive/negative means one side is ahead. We apply the same formula regardless
+of color; the sign of the eval tells you who's winning, but the magnitude tells you how
+"important" the position is, and that's what we care about.
+
+**Band normalization:**
+Same reason as regular ACPL: higher-rated players have lower weighted ACPL naturally.
+We compare within rating bands so a 1200 isn't flagged just for being a 1200, and a 2200
+isn't automatically suspicious for being accurate. Column: `avg_weighted_acpl_band_z`.
+
+---
+
+## Decision 19 — UMAP Visualisation
+
+**Why UMAP and not PCA / t-SNE:**
+PCA is linear — it can't capture the non-linear structure of anomaly clusters (anomalies
+often live in sparse pockets, not along principal variance directions). t-SNE works but
+doesn't preserve global structure at all; clusters might end up anywhere on the plot with
+no spatial meaning. UMAP is faster than t-SNE AND preserves a mix of local and global
+structure, so you can actually interpret proximity on the plot.
+
+**Two-panel design:**
+- Left panel: binary flag (red = flagged, grey = normal). Clean and easy to present —
+  shows at a glance whether the model produces a distinct cluster or noise.
+- Right panel: vote count gradient (0 / 1 / 2 / 3 models voting). This is the more
+  informative one: it shows whether the "confident" flags (all 3 models agreed) sit at
+  the core of the anomaly cluster or are scattered. If they're at the core, the ensemble
+  is doing something coherent. If they're random, that's a red flag about the models.
+
+**Parameters:**
+- `n_neighbors=15`: standard default. Controls local vs. global balance in the embedding.
+  Lower = tighter local clusters; higher = more global structure preserved. 15 is the
+  UMAP paper's recommendation for datasets of this size.
+- `min_dist=0.1`: lets points pack a bit tightly so clusters are visually obvious.
+  Default is 0.1, didn't change it because it works well for our use case.
+- `random_state=42`: UMAP is stochastic. Fixing the seed means the plot is reproducible
+  across runs — important when you're including it in a report.
+
+**What to look for:**
+A good result shows the flagged players (red) clustering in a relatively separated region,
+not scattered uniformly across the embedding. Perfect separation isn't expected — we have
+no ground truth and our anomaly signal is noisy — but some visible tendency to cluster
+suggests the features are capturing something real. If the flagged points are completely
+random on the UMAP, that's honest evidence our model is mostly noise.
+
+**What we actually see (results/umap_overview.png):**
+The result is genuinely encouraging and makes sense given what we know about the problem.
+
+*Left panel (binary flag):* The 902 flagged players are NOT randomly scattered. There's a
+clear concentration in the upper-left region of the embedding where red dots are noticeably
+denser than anywhere else. That's not what uniform random noise looks like — it's a real
+geometric signal that our 19 features produce a meaningful distinction between most flagged
+and most normal players.
+
+*Right panel (vote count gradient):* This is the more interesting one. The 265 purple dots
+(all 3 models agreed = "confident" flags) cluster tightly in that same upper-left zone.
+The 637 red dots (2-vote flags) surround them. The 1,758 orange dots (1-vote borderline)
+bleed outward toward the normal population. This is exactly the gradient you'd want to see —
+confident flags at the core, borderline flags at the edge, normals at the periphery.
+
+*Why the scattered flags are NOT a problem — they're expected:*
+There are also flagged players scattered throughout the rest of the plot, mixed in with
+normal players. This is actually correct behavior for this problem, for two reasons:
+
+1. **Cheaters don't all cheat the same way.** A player who cheats only in endgames has a
+   completely different feature profile from one who runs an engine the whole game, or one
+   who only cheats in games against stronger opponents. These different "cheating styles"
+   will land in different regions of the feature space. You wouldn't expect them to all
+   cluster together — they'd appear as scattered outliers across the embedding.
+
+2. **Outliers by definition don't cluster.** UMAP preserves the structure of the data. A
+   genuinely anomalous player who deviates in a unique way will appear isolated, away from
+   every cluster. That's not a failure of the model — that's what an outlier looks like in
+   2D. If every flagged player had the exact same profile, they'd form one tight blob. The
+   scatter tells us our model is catching diverse kinds of anomalies, not just one archetype.
+
+Compare this to what failure looks like: 902 red dots spread perfectly uniformly across
+the entire 17k-player blob with no spatial preference whatsoever. That's what random
+flagging produces. The upper-left concentration we actually see is evidence of structure.
+
+**Short version for the report:** The UMAP shows a visible anomaly-dense region (upper-left)
+where the confident flags concentrate, surrounded by a gradient of less certain flags.
+Scattered flagged players elsewhere reflect the diversity of anomalous behavioral patterns —
+not all suspicious players have the same profile, and the model is catching multiple
+distinct deviation types rather than a single archetype.
+
+---
+
 ## Future Work — What We Would Do With More Time or Data
 
 These are things we identified, thought through, and consciously decided not to

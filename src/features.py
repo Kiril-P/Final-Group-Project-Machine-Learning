@@ -102,6 +102,11 @@ def aggregate_player_stats(player_df: pd.DataFrame) -> pd.DataFrame:
         # (our minimum) the std is noisy. We include it anyway and let the ensemble
         # absorb the noise from low-game-count players.
         ("avg_acpl_game",       "acpl_consistency",        "std"),
+        # Complexity-weighted ACPL — moves in equal positions get full weight,
+        # moves in already-won/lost positions get near-zero weight.
+        # This is a better engine-use signal than raw ACPL because engines shine
+        # most in precisely the critical, equal positions where the weight is highest.
+        ("weighted_acpl_game",  "avg_weighted_acpl",       "mean"),
     ]:
         if src_col in df.columns:
             agg_spec[agg_name] = (src_col, func)
@@ -242,6 +247,10 @@ def add_engineered_features(agg: pd.DataFrame) -> pd.DataFrame:
         # band normalization we'd flag high-rated players as suspicious just for
         # being good, which is wrong. Comparing within band makes the signal fair.
         ("acpl_consistency",    "acpl_consistency_band_z"),
+        # Complexity-weighted ACPL — same band-normalization rationale as raw ACPL:
+        # higher-rated players naturally have lower weighted ACPL regardless of cheating,
+        # so comparing within band keeps the signal fair.
+        ("avg_weighted_acpl",   "avg_weighted_acpl_band_z"),
     ]:
         if raw_feat in df.columns and "rating_band" in df.columns:
             df[z_feat] = np.nan
@@ -375,6 +384,8 @@ def get_feature_matrix(
                                              # large positive = normal opening, engine-perfect middlegame
             "acpl_consistency_band_z",       # std of ACPL across games, band-normalized
                                              # unusually LOW = suspiciously consistent = engine-like
+            "avg_weighted_acpl_band_z",      # equal-position-weighted ACPL, band-normalized
+                                             # closest feature we have to Regan's methodology
         ]
         for feat in extended_candidates:
             if feat in df.columns:

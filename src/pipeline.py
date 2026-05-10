@@ -29,6 +29,7 @@ from src.interpretation import (
     plot_feature_importance,
     plot_learning_curves,
     plot_roc_curves,
+    plot_umap,
 )
 from src.models import (
     AutoencoderDetector,
@@ -348,6 +349,14 @@ def main(
         len(all_results),
         RESULTS_DIR / "player_explanations.csv",
     )
+
+    # Stage 7c: UMAP visualisation of the full player population.
+    # Reduces the feature space to 2D so we can visually inspect whether the
+    # flagged players cluster separately from the normal population.
+    # Two panels: binary flag (left) and vote-count gradient (right).
+    # This is the last stage — UMAP is slow on 17k points so we run it last.
+    logger.info("Stage 7c: UMAP projection (full population)...")
+    plot_umap(X_all, all_results)
 
     logger.info("Pipeline complete. Outputs in %s", RESULTS_DIR)
     return all_results, importance_df, injection_results

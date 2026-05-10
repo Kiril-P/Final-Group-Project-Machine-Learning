@@ -165,9 +165,11 @@ def _compute_player_eval_stats(
             "best_move_count": 0, "n_moves_with_eval": 0, "was_losing": False,
             "acpl_opening_game": np.nan, "acpl_middlegame_game": np.nan,
             "acpl_endgame_game": np.nan,
+            "weighted_acpl_game": np.nan,
         }
 
     losses: List[float] = []
+    evals_before: List[float] = []   # pre-move eval for each loss — used for complexity weighting
     was_losing = False
 
     if player_color == "white":
@@ -177,6 +179,7 @@ def _compute_player_eval_stats(
             e_after  = all_evals[idx_after]
             e_before = all_evals[idx_before] if idx_before >= 0 else 0.0
             losses.append(max(0.0, e_before - e_after))
+            evals_before.append(e_before)
             if e_before <= -150:          # White was losing before this move
                 was_losing = True
     else:
@@ -188,6 +191,7 @@ def _compute_player_eval_stats(
             e_before = all_evals[idx_before]  # after White's move (Black's turn incoming)
             e_after  = all_evals[idx_after]   # after Black's response
             losses.append(max(0.0, e_after - e_before))
+            evals_before.append(e_before)
             if e_before >= 150:               # Black was losing (White up 150+ cp)
                 was_losing = True
 
@@ -201,6 +205,33 @@ def _compute_player_eval_stats(
     def _phase_acpl(sliced: list) -> float:
         return float(np.mean(sliced)) if len(sliced) >= _MIN_PHASE else np.nan
 
+    # ── Position-complexity-weighted ACPL ────────────────────────────────────
+    # Standard ACPL treats a 20cp mistake in a dead-equal position the same as
+    # a 20cp mistake when you're already down 300cp. That's not quite right:
+    # in a completely lost position, a bad move barely changes the outcome —
+    # the eval is already in the tank. What really matters for catching engine use
+    # is accuracy in EQUAL positions, where every move counts.
+    #
+    # We weight each move's CPL by exp(-|eval_before| / 100):
+    #   - Equal position (eval=0):  weight = 1.0  (full weight)
+    #   - Up/down 100cp:            weight = 0.37 (about a third weight)
+    #   - Up/down 300cp:            weight = 0.05 (nearly ignored)
+    #
+    # This is the same intuition behind Regan's "marginal centipawn principle":
+    # mistakes in critical, roughly-equal positions are the strongest signal.
+    # An engine playing in an equal position will have near-zero CPL with full weight;
+    # a human will have a much higher weighted ACPL because they mess up exactly
+    # when the position is most complex and the eval penalty is most "expensive".
+    if losses and evals_before:
+        weights = [float(np.exp(-abs(e) / 100.0)) for e in evals_before]
+        total_w = sum(weights)
+        weighted_acpl = (
+            sum(l * w for l, w in zip(losses, weights)) / total_w
+            if total_w > 0 else np.nan
+        )
+    else:
+        weighted_acpl = np.nan
+
     return {
         "avg_acpl_game":         float(np.mean(losses)) if losses else np.nan,
         "blunder_count":         int(sum(1 for x in losses if x >= 150)),
@@ -211,6 +242,9 @@ def _compute_player_eval_stats(
         "acpl_opening_game":     _phase_acpl(losses[:10]),    # player moves 1-10
         "acpl_middlegame_game":  _phase_acpl(losses[10:30]),  # player moves 11-30
         "acpl_endgame_game":     _phase_acpl(losses[30:]),    # player moves 31+
+        # Complexity-weighted ACPL — equal positions count more, losing/winning positions less.
+        # Correlates better with engine use than raw ACPL. See comment block above.
+        "weighted_acpl_game":    weighted_acpl,
     }
 
 

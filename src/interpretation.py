@@ -507,6 +507,17 @@ def generate_player_explanations(
             ),
             "confident": True,
         },
+        "avg_weighted_acpl_band_z": {
+            "direction": "low",
+            "text": (
+                "Complexity-weighted ACPL is unusually low for their rating band — "
+                "this metric down-weights moves in already-won or lost positions and "
+                "focuses on equal, contested positions where mistakes are most costly. "
+                "A suspiciously low value means near-engine accuracy precisely when "
+                "the position is hardest to play — the clearest sign of engine use."
+            ),
+            "confident": True,
+        },
     }
 
     flagged = results[results["ensemble_flag"] == True].copy()
@@ -601,6 +612,119 @@ def generate_player_explanations(
         out.get("confident_1", pd.Series(dtype=bool)).sum() if "confident_1" in out.columns else "?",
     )
     return out
+
+
+def plot_umap(
+    X: np.ndarray,
+    results: pd.DataFrame,
+    save: bool = True,
+) -> None:
+    """
+    2D UMAP projection of the full player population — two panels side by side.
+
+    Left  — binary: flagged (red) vs. normal (blue-grey).
+    Right — vote count: each player colored by how many of the 3 ensemble
+            models flagged them (0 = nobody / 1 = borderline / 2 = flagged /
+            3 = all three agreed).  The right panel is more informative than
+            the left because it shows the "confidence gradient" in the anomaly
+            cluster — are the confident flags isolated from everyone else, or
+            do they blur into the normal population?
+
+    Expects X to be ALREADY scaled (the same array passed to run_all_models).
+    Rows must correspond to results rows in the same order.
+
+    Saves to results/umap_overview.png.
+    """
+    try:
+        import umap as umap_lib
+    except ImportError:
+        logger.warning(
+            "umap-learn is not installed — skipping UMAP plot. "
+            "Run: pip install umap-learn"
+        )
+        return
+
+    logger.info("Fitting UMAP on %s players × %s features ...", X.shape[0], X.shape[1])
+
+    # n_neighbors=15: standard default — balances local vs global structure.
+    # min_dist=0.1:   let points pack a bit tightly so clusters are visible.
+    # random_state:   fix seed for reproducibility (UMAP is stochastic).
+    reducer = umap_lib.UMAP(n_neighbors=15, min_dist=0.1, random_state=42, verbose=False)
+    emb = reducer.fit_transform(X)   # shape (n_players, 2)
+
+    votes = results["anomaly_votes"].values.astype(int)
+    flags = results["ensemble_flag"].values.astype(bool)
+
+    # ── Colour / style lookup per vote count ─────────────────────────────────
+    # Gradient from neutral grey → amber → red → dark purple.
+    # Alpha and size ramp up so high-suspicion players pop visually.
+    VOTE_STYLE = {
+        0: dict(color="#9DB4C0", alpha=0.25, s=6,  label="0 votes — normal"),
+        1: dict(color="#F4A261", alpha=0.55, s=12, label="1 vote  — borderline"),
+        2: dict(color="#E63946", alpha=0.80, s=22, label="2 votes — flagged (≥2/3)"),
+        3: dict(color="#6A0572", alpha=1.00, s=35, label="3 votes — confident (all agreed)"),
+    }
+
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+    fig.suptitle(
+        "UMAP Projection — Chess Behavioral Anomaly Detection\n"
+        f"({len(results):,} players, {int(flags.sum()):,} ensemble-flagged)",
+        fontsize=13,
+        y=1.01,
+    )
+
+    # ── Left panel: binary flag ───────────────────────────────────────────────
+    ax = axes[0]
+    normal_mask  = ~flags
+    flagged_mask =  flags
+    ax.scatter(
+        emb[normal_mask,  0], emb[normal_mask,  1],
+        c="#9DB4C0", alpha=0.20, s=6,
+        label=f"Normal ({normal_mask.sum():,})",
+        rasterized=True,
+    )
+    ax.scatter(
+        emb[flagged_mask, 0], emb[flagged_mask, 1],
+        c="#E63946", alpha=0.80, s=20,
+        label=f"Flagged — ≥2/3 models ({flagged_mask.sum():,})",
+        rasterized=True,
+    )
+    ax.set_title("Ensemble Flag (majority vote ≥ 2 of 3)", fontsize=11)
+    ax.legend(markerscale=2, fontsize=9, loc="best")
+    ax.set_xlabel("UMAP dim 1", fontsize=9)
+    ax.set_ylabel("UMAP dim 2", fontsize=9)
+    ax.grid(True, alpha=0.15)
+    ax.tick_params(labelsize=8)
+
+    # ── Right panel: vote count gradient ─────────────────────────────────────
+    ax = axes[1]
+    # Draw low-vote points first so high-suspicion players render on top
+    for v in [0, 1, 2, 3]:
+        mask = votes == v
+        if mask.sum() == 0:
+            continue
+        style = VOTE_STYLE[v]
+        ax.scatter(
+            emb[mask, 0], emb[mask, 1],
+            c=style["color"], alpha=style["alpha"], s=style["s"],
+            label=f"{style['label']} ({mask.sum():,})",
+            rasterized=True,
+        )
+    ax.set_title("Model Vote Count (0 = clean → 3 = all three agreed)", fontsize=11)
+    ax.legend(markerscale=2, fontsize=9, loc="best")
+    ax.set_xlabel("UMAP dim 1", fontsize=9)
+    ax.set_ylabel("UMAP dim 2", fontsize=9)
+    ax.grid(True, alpha=0.15)
+    ax.tick_params(labelsize=8)
+
+    plt.tight_layout()
+
+    if save:
+        path = RESULTS_DIR / "umap_overview.png"
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        logger.info("UMAP overview saved to %s", path)
+    plt.show()
+    plt.close(fig)
 
 
 def plot_feature_importance(importance_df: pd.DataFrame, save: bool = True) -> None:

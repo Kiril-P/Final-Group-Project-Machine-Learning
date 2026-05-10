@@ -516,21 +516,36 @@ def run_all_models(
     meta: pd.DataFrame,
     contamination_overrides: Optional[dict] = None,
     model_params: Optional[dict] = None,
+    X_score: Optional[np.ndarray] = None,
 ) -> pd.DataFrame:
-    """Fit all five detectors; return meta + scores, predictions, and ensemble vote.
+    """Fit all detectors on X; score on X_score (or X if not provided).
+
+    The fit/score split exists so we can train on the 70% training partition
+    but produce scores for ALL players (train + val + test) without any leakage:
+    models never see val/test data during training, the scaler is already fitted
+    on train-only before this function is called, and evaluation metrics in
+    holdout_evaluation.csv are computed separately and are not affected.
+
+    This is equivalent to production deployment: once a model is trained and
+    validated, you run it on all available data to get a complete picture.
 
     Args:
-        X: Scaled training feature matrix.
-        meta: Player metadata aligned with X rows.
-        contamination_overrides: Legacy single-value override — sets contamination
-            only (kept for notebook back-compat). Ignored per-model when model_params
-            provides a full param dict for that model.
-        model_params: Full per-model param dicts from run_hyperparameter_search(),
-            e.g. {"IsolationForest": {"contamination": 0.03, "n_estimators": 200}}.
-            Takes precedence over contamination_overrides for any model it covers.
+        X:       Scaled TRAINING feature matrix — models are fit on this only.
+        meta:    Player metadata aligned with X_score rows (all players if
+                 X_score is provided, else training players).
+        contamination_overrides: Legacy contamination override (kept for
+                 notebook back-compat).
+        model_params: Full per-model param dicts from run_hyperparameter_search().
+        X_score: If provided, models are fit on X but scored on X_score.
+                 Pass the full dataset (train + val + test, all pre-scaled with
+                 the train-fitted scaler) to get complete player coverage.
+                 If None, models are scored on X (original behaviour).
     """
     overrides = contamination_overrides or {}
     params = model_params or {}
+
+    # What we score on — either the full dataset or just train (default)
+    X_eval = X_score if X_score is not None else X
 
     def _kwargs(name: str, default_contamination: float = 0.05) -> dict:
         """Return constructor kwargs: full search result > contamination override > default."""
@@ -554,9 +569,9 @@ def run_all_models(
 
     for m in model_list:
         logger.info("Fitting %s...", m.name)
-        m.fit(X)
-        results[f"{m.name}_score"] = m.score(X)
-        results[f"{m.name}_label"] = m.predict(X)
+        m.fit(X)                              # always fit on training data only
+        results[f"{m.name}_score"] = m.score(X_eval)   # score on full data if provided
+        results[f"{m.name}_label"] = m.predict(X_eval)
 
     # ── Ensemble voting — strong models only ─────────────────────────────────
     # We ran overlap analysis on the full results to decide who gets a vote.

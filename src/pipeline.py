@@ -194,6 +194,30 @@ def main(
     results.to_csv(RESULTS_DIR / "model_results.csv", index=False)
     logger.info("Saved model results to %s", RESULTS_DIR / "model_results.csv")
 
+    # ── Stage 3b: Score ALL players (train + val + test) ─────────────────────
+    # Models are still trained on X_train only — no leakage.
+    # The scaler was already fit on X_train (Stage 2b), so X_val and X_test are
+    # already in the same normalised space.  We simply apply the trained models
+    # to those pre-scaled arrays.  This is identical to production deployment:
+    # you train once, then score any new player that comes in.
+    # Evaluation metrics in holdout_evaluation.csv are computed separately (Stage 4b)
+    # and are not affected by this step.
+    logger.info("Stage 3b: Scoring ALL players with train-fitted models...")
+    X_all    = np.vstack([X_train, X_val, X_test])
+    meta_all = pd.concat([meta_train, meta_val, meta_test]).reset_index(drop=True)
+    all_results = run_all_models(
+        X_train,           # fit on training data only
+        meta_all,          # metadata for all players (just for labelling rows)
+        model_params=best_params,
+        X_score=X_all,     # score over the full scaled dataset
+    )
+    all_results.to_csv(RESULTS_DIR / "all_player_results.csv", index=False)
+    logger.info(
+        "Scored %s players total → %s",
+        len(all_results),
+        RESULTS_DIR / "all_player_results.csv",
+    )
+
     logger.info("Stage 4: Evaluation — injection recovery...")
     # Re-fit IF with its tuned params for use in Stages 5-7
     if_model = IsolationForestDetector(**best_params.get("IsolationForest", {"contamination": 0.05}))
@@ -313,17 +337,20 @@ def main(
     # Features with a clear cheating interpretation get a plain-English explanation;
     # features that are statistically anomalous but ambiguous are marked as
     # "model-detected" rather than inventing a reason.
-    logger.info("Stage 7b: Generating per-player explanations...")
-    explanations_df = generate_player_explanations(results, agg, feature_names)
+    logger.info("Stage 7b: Generating per-player explanations (all players)...")
+    # Use all_results so every player — not just the 70% training split — gets
+    # an explanation if the ensemble flags them.
+    explanations_df = generate_player_explanations(all_results, agg, feature_names)
     explanations_df.to_csv(RESULTS_DIR / "player_explanations.csv", index=False)
     logger.info(
-        "Explanations saved for %s flagged players → %s",
+        "Explanations saved for %s flagged players (out of %s total) → %s",
         len(explanations_df),
+        len(all_results),
         RESULTS_DIR / "player_explanations.csv",
     )
 
     logger.info("Pipeline complete. Outputs in %s", RESULTS_DIR)
-    return results, importance_df, injection_results
+    return all_results, importance_df, injection_results
 
 
 if __name__ == "__main__":

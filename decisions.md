@@ -342,6 +342,59 @@ within rating bands, for the same reasons as overall avg_acpl (see decision #11)
 
 ---
 
+## Decision 16 — Equal Voting vs. AUC-Weighted Ensemble
+
+**What we chose:** Each of the three ensemble models (LOF, Autoencoder, OC-SVM) casts an
+equal vote. A player is flagged if ≥ 2 of 3 models agree.
+
+**What we considered:** Weight each model's vote by its AUC score on the synthetic
+validation set, so a model with AUC 0.96 counts for more than one with AUC 0.79.
+
+**Why we kept equal voting:**
+Weighting only changes the outcome in the narrow band of players where models
+*disagree* — and only when one model's weight is strong enough to override the majority
+on its own. In practice, with three models that all perform reasonably well (AUC 0.79–0.96),
+a weighted vote would almost always reach the same verdict as a simple majority vote.
+
+The exception would be something like a 0.96 / 0.79 / 0.79 split where the strong model's
+"yes" would always beat two "no" votes — but that means we're flagging players based on
+one model alone, which is less robust than the whole point of building an ensemble.
+
+There's also an honesty issue: our AUCs are measured on *synthetic* anomalies that we
+designed ourselves, not real cheaters. Using those synthetic AUCs to upweight one model
+over another would be optimizing for simulated performance that may not reflect reality.
+
+Equal voting is more transparent (easy to explain: "two models agreed"), more robust
+(no single model can dominate), and in our case nearly equivalent in outcome.
+
+If we had real labeled cheater data, AUC-weighted or stacked ensemble learning would
+be worth revisiting.
+
+---
+
+## Decision 17 — Scoring All Players, Not Just the Training Split
+
+**What we chose:** After fitting models on the 70% training split, we run scoring over
+all 28k+ players (train + val + test) and save the results to `all_player_results.csv`.
+Player explanations are generated from this full-coverage result.
+
+**Why this is not leakage:**
+Leakage would mean the model learned from val/test data — which it didn't.
+The StandardScaler was fit exclusively on X_train. Each model was `fit()` on X_train only.
+The val and test arrays were already transformed using the train-only scaler.
+Scoring them with a trained model is identical to production deployment: you train once,
+then score any new player who arrives — the model doesn't change.
+
+Evaluation metrics (holdout_evaluation.csv) come from a completely separate Stage 4b
+evaluation pipeline and are not affected by this step.
+
+**Why we did it:**
+The 30% of players in val+test are real players with real behavioral patterns. Using the
+pipeline to only flag players in the training split means we miss 30% of the population
+for no good reason. The whole point of the system is to triage a full player pool.
+
+---
+
 ## Future Work — What We Would Do With More Time or Data
 
 These are things we identified, thought through, and consciously decided not to

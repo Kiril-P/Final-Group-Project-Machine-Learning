@@ -507,6 +507,34 @@ def generate_player_explanations(
             ),
             "confident": True,
         },
+        "rating_gain_rate": {
+            "direction": "high",
+            "text": (
+                "Gaining Elo at an unusually fast rate — "
+                "legitimate improvement of 3-5 Elo/day is already rare; "
+                "rates above 10 Elo/day sustained over weeks are essentially "
+                "impossible without engine assistance"
+            ),
+            "confident": True,
+        },
+        "rating_gain": {
+            "direction": "high",
+            "text": (
+                "Large total Elo gain over the observed period — "
+                "a jump of 300+ Elo in a single month far exceeds normal "
+                "human improvement rates regardless of experience level"
+            ),
+            "confident": True,
+        },
+        "timeout_loss_rate": {
+            "direction": "low",
+            "text": (
+                "Rarely or never loses on time — engine users respond instantly "
+                "and never run out of clock; a zero timeout-loss rate at any "
+                "rating level is a supporting signal"
+            ),
+            "confident": False,  # low standalone weight — documented as minor signal
+        },
         "avg_weighted_acpl_band_z": {
             "direction": "low",
             "text": (

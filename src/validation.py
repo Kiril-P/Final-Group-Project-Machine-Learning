@@ -36,6 +36,20 @@ def inject_synthetic_anomalies(
     X_arr = X.values if hasattr(X, "values") else X
 
     if strategy == "engine_perfect":
+        # ── SANITY-CHECK benchmark, not a real-world performance metric ──────
+        # Synthetic points are placed at the 99th percentile of every feature
+        # in X_arr simultaneously, then jittered by 5% noise.
+        #
+        # WHY AUC ≈ 1.0 is EXPECTED here (and not evidence of over-fitting):
+        #   LOF  → p99 points have the lowest local density by construction.
+        #   IF   → extreme values are isolated in ≤ 2 splits by construction.
+        #   OC-SVM → they land outside the normal-data support by construction.
+        #   AE   → they produce the highest reconstruction error by construction.
+        # Any functioning anomaly detector will find them. The result validates
+        # that the models are numerically working, nothing more.
+        #
+        # The meaningful benchmark is the "subtle" strategy — those anomalies
+        # stay on the data manifold and require real discriminative power.
         synthetic = np.tile(np.percentile(X_arr, 99, axis=0), (n, 1))
         synthetic += rng.normal(0, 0.05, synthetic.shape)
     elif strategy == "extreme_outlier":
@@ -51,6 +65,97 @@ def inject_synthetic_anomalies(
         for i in range(n):
             feats = rng.choice(n_features, size=n_perturb, replace=False)
             synthetic[i, feats] += rng.normal(0, 1.5, n_perturb) * sds[feats]
+
+    elif strategy == "realistic_cheater":
+        # ── DOMAIN-GROUNDED benchmark ─────────────────────────────────────────
+        # Profile constructed from documented patterns in Lichess/Chess.com fair
+        # play team reports and academic literature (Regan 2011, Guid & Bratko 2006,
+        # Oxera 2023 review of computer-move detection).
+        #
+        # CORE INSIGHT from the literature: sophisticated engine-assisted players
+        # do NOT play perfectly — they deliberately play the 2nd or 3rd engine
+        # choice, occasionally allow a "blunder" to stay under detection thresholds,
+        # and maintain normal behavioral patterns (game length, opening variety) to
+        # blend in.  Detection therefore requires looking at the DISTRIBUTION of
+        # quality across many games, not individual move perfection.
+        #
+        # What this means for our synthetic profile:
+        #   - Push eval/performance features to p5–p10 (suspicious) or p88–p92
+        #     (suspicious high) — "very good but not impossibly perfect"
+        #   - Vary values across synthetic players (uniform sample in range, not
+        #     a single clone) so the benchmark isn't trivially clustered
+        #   - Keep all behavioral features at 0 ± small noise (population mean
+        #     in scaled space) — exactly what sophisticated cheaters maintain
+        #
+        # Feature assignments (in StandardScaler-transformed space, 0 = mean):
+        #
+        #   SUSPICIOUS LOW  (very low ACPL / errors = engine-like accuracy):
+        #     avg_acpl_band_z, avg_weighted_acpl_band_z  — primary ACPL signals
+        #     avg_acpl_middlegame_band_z  — strongest phase: engines consulted when
+        #                                   positions get complex (Guid & Bratko 2006)
+        #     avg_acpl_opening_band_z, avg_acpl_endgame_band_z  — secondary phases
+        #     acpl_consistency_band_z  — engines are consistently accurate; humans
+        #                                fluctuate heavily game to game
+        #     blunder_rate    — engines almost never drop eval > 1.5 pawns
+        #     timeout_loss_rate  — engine responds instantly; never runs out of time
+        #       (pushed to p8, not p1 — many legitimate players also rarely time out)
+        #
+        #   SUSPICIOUS HIGH (performance above peers):
+        #     best_move_rate_band_z   — engine plays near-optimal move far too often
+        #     win_rate                — wins more than peers at same Elo
+        #     performance_vs_actual   — consistently outperforms their rating
+        #     comeback_rate           — escapes losing positions abnormally often
+        #     underdog_win_rate       — beats stronger players at improbable rates
+        #     rating_gain_rate        — above-average climb (p75, not p92 — this
+        #                               signal is noisy; new human players also improve
+        #                               quickly, so we don't push it hard)
+        #
+        #   KEPT NORMAL (population mean ± small noise):
+        #     avg_turns, turns_std, avg_opening_ply, rating_volatility,
+        #     avg_opponent_rating, n_games, avg_rating, avg_rating_diff,
+        #     rating_gain (raw, not rate), acpl_phase_gap_band_z
+        #     — sophisticated cheaters deliberately keep these normal.
+
+        # Start everything at population mean (0 in scaled space) + tiny jitter
+        synthetic = rng.normal(0.0, 0.08, (n, X_arr.shape[1]))
+
+        cols = list(X.columns) if hasattr(X, "columns") else []
+
+        # (lo_pct_min, lo_pct_max) — sample uniformly in this percentile range
+        suspicious_low: dict[str, tuple[float, float]] = {
+            "avg_acpl_band_z":            (3,  10),
+            "avg_weighted_acpl_band_z":   (3,  10),
+            "avg_acpl_middlegame_band_z": (3,  10),
+            "avg_acpl_opening_band_z":    (5,  12),
+            "avg_acpl_endgame_band_z":    (5,  12),
+            "acpl_consistency_band_z":    (5,  12),
+            "blunder_rate":               (3,  10),
+            "timeout_loss_rate":          (5,  12),
+        }
+        # (hi_pct_min, hi_pct_max)
+        suspicious_high: dict[str, tuple[float, float]] = {
+            "best_move_rate_band_z":  (88, 96),
+            "win_rate":               (86, 94),
+            "performance_vs_actual":  (88, 95),
+            "comeback_rate":          (85, 93),
+            "underdog_win_rate":      (82, 92),
+            "rating_gain_rate":       (72, 82),   # noisy signal — mild push only
+        }
+
+        for feat, (plo, phi) in suspicious_low.items():
+            if feat in cols:
+                ci = cols.index(feat)
+                lo = np.percentile(X_arr[:, ci], plo)
+                hi = np.percentile(X_arr[:, ci], phi)
+                synthetic[:, ci] = rng.uniform(lo, hi, n)
+
+        for feat, (plo, phi) in suspicious_high.items():
+            if feat in cols:
+                ci = cols.index(feat)
+                lo = np.percentile(X_arr[:, ci], plo)
+                hi = np.percentile(X_arr[:, ci], phi)
+                synthetic[:, ci] = rng.uniform(lo, hi, n)
+
     else:
         raise ValueError(f"Unknown strategy: {strategy}")
 

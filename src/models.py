@@ -574,29 +574,54 @@ def run_all_models(
         results[f"{m.name}_label"] = m.predict(X_eval)
 
     # ── Ensemble voting — strong models only ─────────────────────────────────
-    # We ran overlap analysis on the full results to decide who gets a vote.
-    # Short version: only LOF, Autoencoder, and OneClassSVM make it in.
+    # We evaluated all 6 models and selected the 3 that contribute genuine,
+    # non-redundant signal.  The other 3 are still scored and stored in every
+    # results CSV so the analysis is fully transparent — they just don't vote.
     #
-    # Why we dropped the others:
-    #   - HDBSCAN: flags 0 players on this dataset (threshold never crossed).
-    #     Its scores have some ranking power (AUC 0.67) but it contributes
-    #     zero votes in practice. Kept in results/ for reporting, not voting.
-    #   - IsolationForest: AUC 0.72. Has 882 "unique" catches that LOF/AE miss,
-    #     but at that accuracy level those are almost certainly false positives,
-    #     not real anomalies the good models overlooked.
-    #   - ZScoreBaseline: AUC 0.76, 491 unique catches, same reasoning as IF.
-    #     It's a useful sanity check but shouldn't drive ensemble decisions.
+    # ── EXCLUDED from ensemble (comparison only) ──────────────────────────────
     #
-    # The three voters:
-    #   LOF          — AUC 0.957, density-based, best at catching subtle outliers
-    #   Autoencoder  — AUC 0.959, reconstruction-based, complements LOF well
-    #                  (they agree only ~26-35% of the time, so they're genuinely
-    #                  looking at different things)
-    #   OneClassSVM  — AUC 0.842, margin-based, adds a third perspective
-    #                  with 159 unique catches not found by LOF or AE
+    # HDBSCAN  ← COMPARISON ONLY — NOT USED FOR ANY OPERATIONAL DECISION
+    #   We tried HDBSCAN as a density-based alternative to LOF.  It did not work
+    #   on this dataset.  AUC = 0.599 on the subtle benchmark (barely above the
+    #   0.5 random baseline) and AUC = 0.767 on the sanity_check benchmark.
+    #   LOF already covers the density-based angle far better (AUC 0.973 subtle).
+    #   All HDBSCAN scores and labels are still written to results CSVs so we can
+    #   show and explain the failure — but its vote is excluded from ensemble_flag
+    #   and ensemble_confident.  See Decision 25 in decisions.md.
     #
-    # Flag logic: majority vote (≥2 of 3).
-    # All 6 model scores/labels are still stored in the CSV so nothing is hidden.
+    # IsolationForest  — AUC 0.746 (subtle), below the ZScore univariate baseline
+    #   (0.781).  A tree-based model should outperform a univariate z-score on
+    #   multi-feature data; that it doesn't suggests the forest isn't capturing
+    #   useful feature interactions here.  It also has 882 "unique" catches that
+    #   neither LOF nor AE find — at 0.746 AUC those are very likely false
+    #   positives, not real anomalies the better models missed.
+    #
+    # ZScoreBaseline  — AUC 0.781 (subtle).  Useful for understanding the lower
+    #   bound; it correctly flags univariate extremes.  But a pure max-|z-score|
+    #   rule completely misses players who are moderately anomalous across many
+    #   features simultaneously — exactly the sophisticated cheating pattern.
+    #
+    # ── ENSEMBLE VOTERS ───────────────────────────────────────────────────────
+    #
+    #   LOF          — AUC 0.973 subtle / 1.000 sanity_check
+    #                  Density-based; best single model on this dataset.
+    #                  Captures players who are outliers in local neighborhoods,
+    #                  which aligns well with the "unusual for their peer group"
+    #                  framing of cheating detection.
+    #
+    #   Autoencoder  — AUC 0.937 subtle / 1.000 sanity_check
+    #                  Reconstruction-based; learns the normal manifold and flags
+    #                  anything that doesn't reconstruct well.  Complements LOF:
+    #                  they agree on roughly 30% of flags, meaning each finds a
+    #                  genuinely different subset of suspicious players.
+    #
+    #   OneClassSVM  — AUC 0.883 subtle / 1.000 sanity_check
+    #                  Margin-based; defines a hypersphere of "normal" behavior.
+    #                  Adds a third geometrically distinct perspective and catches
+    #                  ~159 players that neither LOF nor AE flag.
+    #
+    # Flag logic: majority vote (≥2 of 3) → ensemble_flag  (recall-oriented)
+    #             unanimous (= 3 of 3)     → ensemble_confident  (precision-oriented)
     ENSEMBLE_VOTERS = ["LOF", "Autoencoder", "OneClassSVM"]
     voter_label_cols = [f"{n}_label" for n in ENSEMBLE_VOTERS if f"{n}_label" in results.columns]
     results["anomaly_votes"] = (results[voter_label_cols] == -1).sum(axis=1)

@@ -240,17 +240,31 @@ def main(
     ]
 
     # Stage 4a: Validation set evaluation (used for model comparison / selection)
+    #
+    # Two benchmark strategies:
+    #   "sanity_check" (formerly "engine_perfect"):
+    #       Synthetic players placed at p99 of every feature → AUC ≈ 1.0 for every
+    #       working anomaly detector, by construction.  This proves the models function
+    #       numerically; it is NOT evidence of real-world effectiveness or overfitting.
+    #       See validation.py for the full explanation of why this result is expected.
+    #   "subtle":
+    #       Real player rows with ~1/3 of features perturbed by 1.5σ — stays on the
+    #       data manifold.  This is the number that actually matters for model selection.
     logger.info("Stage 4a: Validation set evaluation...")
     val_rows = []
-    for strategy in ("engine_perfect", "subtle"):
+    for strategy, label, n_inj in [
+        ("engine_perfect",   "sanity_check",      50),   # proves models work; AUC≈1.0 expected
+        ("subtle",           "subtle",             50),   # main generalist benchmark
+        ("realistic_cheater","realistic_cheater", 100),   # domain-grounded cheater profile
+    ]:
         X_inj_val, y_inj_val = inject_synthetic_anomalies(
-            pd.DataFrame(X_val, columns=feature_names), n=50, strategy=strategy
+            pd.DataFrame(X_val, columns=feature_names), n=n_inj, strategy=strategy
         )
         for ctor, name in model_ctors:
             m = ctor()
             m.fit(X_train)
             metrics = evaluate_injection_recovery(m, X_inj_val, y_inj_val)
-            val_rows.append({"model": name, "strategy": strategy, "split": "val", **metrics})
+            val_rows.append({"model": name, "strategy": label, "split": "val", **metrics})
     val_df = pd.DataFrame(val_rows)
     val_df.to_csv(RESULTS_DIR / "val_evaluation.csv", index=False)
     logger.info("Validation evaluation saved.\n%s", val_df.to_string(index=False))
@@ -260,30 +274,45 @@ def main(
     # hyperparameters would invalidate the evaluation entirely.
     logger.info("Stage 4b: Test set evaluation (final, unseen)...")
     test_rows = []
-    # Collect raw scores from the subtle strategy for the ROC curve plot.
-    roc_scores: dict = {}
-    roc_y_true: np.ndarray | None = None
-    for strategy in ("engine_perfect", "subtle"):
+    # Collect raw scores for both meaningful benchmarks for the ROC curve plot.
+    # sanity_check is excluded from ROC — it always gives AUC≈1.0 by construction.
+    roc_scores_subtle:   dict = {}
+    roc_scores_realistic: dict = {}
+    roc_y_subtle:   np.ndarray | None = None
+    roc_y_realistic: np.ndarray | None = None
+
+    for strategy, label, n_inj in [
+        ("engine_perfect",    "sanity_check",      50),
+        ("subtle",            "subtle",             50),
+        ("realistic_cheater", "realistic_cheater", 100),
+    ]:
         X_inj_eval, y_inj_eval = inject_synthetic_anomalies(
-            pd.DataFrame(X_test, columns=feature_names), n=50, strategy=strategy
+            pd.DataFrame(X_test, columns=feature_names), n=n_inj, strategy=strategy
         )
         X_inj_eval_arr = X_inj_eval if isinstance(X_inj_eval, np.ndarray) else X_inj_eval.values
         for ctor, name in model_ctors:
             m = ctor()
             m.fit(X_train)
             metrics = evaluate_injection_recovery(m, X_inj_eval_arr, y_inj_eval)
-            test_rows.append({"model": name, "strategy": strategy, "split": "test", **metrics})
-            if strategy == "subtle":
-                roc_scores[name] = m.score(X_inj_eval_arr)
-                roc_y_true = y_inj_eval
+            test_rows.append({"model": name, "strategy": label, "split": "test", **metrics})
+            if label == "subtle":
+                roc_scores_subtle[name] = m.score(X_inj_eval_arr)
+                roc_y_subtle = y_inj_eval
+            elif label == "realistic_cheater":
+                roc_scores_realistic[name] = m.score(X_inj_eval_arr)
+                roc_y_realistic = y_inj_eval
+
     holdout_df = pd.DataFrame(test_rows)
     holdout_df.to_csv(RESULTS_DIR / "holdout_evaluation.csv", index=False)
     logger.info("Test evaluation saved.\n%s", holdout_df.to_string(index=False))
 
-    logger.info("Stage 4b (cont): Plotting ROC curves (subtle, test set)...")
-    if roc_y_true is not None:
-        roc_df = plot_roc_curves(roc_scores, roc_y_true)
-        roc_df.to_csv(RESULTS_DIR / "roc_curves.csv", index=False)
+    logger.info("Stage 4b (cont): Plotting ROC curves (subtle + realistic_cheater, test set)...")
+    if roc_y_subtle is not None:
+        roc_df = plot_roc_curves(roc_scores_subtle, roc_y_subtle)
+        roc_df.to_csv(RESULTS_DIR / "roc_curves_subtle.csv", index=False)
+    if roc_y_realistic is not None:
+        roc_df_r = plot_roc_curves(roc_scores_realistic, roc_y_realistic)
+        roc_df_r.to_csv(RESULTS_DIR / "roc_curves_realistic.csv", index=False)
 
     # Reference injection result (IF on test, subtle) for notebook back-compat
     X_inj, y_inj = inject_synthetic_anomalies(

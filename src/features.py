@@ -58,6 +58,13 @@ def aggregate_player_stats(player_df: pd.DataFrame) -> pd.DataFrame:
     if "was_losing" in df.columns:
         df["comeback_win"] = (df["was_losing"].astype(bool) & (df["won"] == 1)).astype(int)
 
+    # ── Sort by game date so "first" / "last" aggregations are chronological ──
+    # We need the earliest and latest game per player to compute rating trajectory.
+    # Without sorting, groupby "first"/"last" would just give arbitrary row order.
+    if "game_date" in df.columns:
+        df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
+        df = df.sort_values(["player_id", "game_date"])
+
     # ── Base aggregation ──────────────────────────────────────────────────────
     agg_spec: dict = dict(
         n_games=("id", "count"),
@@ -74,6 +81,20 @@ def aggregate_player_stats(player_df: pd.DataFrame) -> pd.DataFrame:
         underdog_games=("is_underdog", "sum"),
         underdog_wins=("underdog_won", "sum"),
     )
+
+    # ── Rating trajectory columns (Lichess only — requires UTCDate) ──────────
+    # "first" and "last" work correctly because we sorted by game_date above.
+    # first_rating_obs / last_rating_obs: player's Elo at the earliest and latest
+    # game in the sample.  The gap tells us how fast they are climbing.
+    if "game_date" in df.columns:
+        agg_spec["first_rating_obs"] = ("player_rating", "first")
+        agg_spec["last_rating_obs"]  = ("player_rating", "last")
+        agg_spec["first_date"]       = ("game_date",     "first")
+        agg_spec["last_date"]        = ("game_date",     "last")
+
+    # ── Timeout loss count (Lichess only) ──────────────────────────────────────
+    if "is_timeout_loss" in df.columns:
+        agg_spec["total_timeout_losses"] = ("is_timeout_loss", "sum")
 
     # ── Optional move-time columns (large Lichess dataset only) ───────────────
     for src_col, agg_name, func in [
@@ -166,6 +187,43 @@ def add_engineered_features(agg: pd.DataFrame) -> pd.DataFrame:
         df["underdog_wins"] / df["underdog_games"].replace(0, np.nan)
     ).fillna(0.0)
 
+    # ── Rating trajectory features (Lichess only — requires timestamps) ─────────
+    # rating_gain: total Elo gained from first to last observed game.
+    # Positive = player is climbing. A +400 gain in one month is extremely suspicious.
+    # Negative is fine — losing Elo is normal.
+    #
+    # rating_gain_rate: Elo gained PER DAY. This is the key signal.
+    # A legitimate player improving at 3-5 Elo/day is already unusually fast.
+    # 10+ Elo/day over weeks is essentially impossible without engine assistance.
+    # We clip days_active to at least 1 to avoid divide-by-zero for same-day players.
+    if "first_rating_obs" in df.columns and "last_rating_obs" in df.columns:
+        df["rating_gain"] = df["last_rating_obs"] - df["first_rating_obs"]
+        if "first_date" in df.columns and "last_date" in df.columns:
+            days = (df["last_date"] - df["first_date"]).dt.days.clip(lower=1)
+            df["rating_gain_rate"] = df["rating_gain"] / days
+        else:
+            df["rating_gain_rate"] = np.nan
+        logger.info(
+            "Rating trajectory computed. Median gain: %.0f Elo, median rate: %.2f Elo/day",
+            df["rating_gain"].median(),
+            df["rating_gain_rate"].median() if "rating_gain_rate" in df.columns else float("nan"),
+        )
+    else:
+        df["rating_gain"]      = np.nan
+        df["rating_gain_rate"] = np.nan
+
+    # ── Timeout loss rate (Lichess only) ──────────────────────────────────────
+    # Fraction of games the player LOST because they ran out of time.
+    # Engine users respond instantly — they effectively never flag.
+    # This is Elo-independent: at any rating, running out of time is a human thing.
+    # Players with zero games get 0.0, not NaN, so they aren't dropped.
+    if "total_timeout_losses" in df.columns:
+        df["timeout_loss_rate"] = (
+            df["total_timeout_losses"] / df["n_games"].replace(0, np.nan)
+        ).fillna(0.0)
+    else:
+        df["timeout_loss_rate"] = np.nan
+
     # ── New features (large Lichess dataset only — require clock/eval annotations) ──
 
     # Move-time coefficient of variation = std / mean across all of a player's think times.
@@ -182,8 +240,21 @@ def add_engineered_features(agg: pd.DataFrame) -> pd.DataFrame:
     # Fraction of moves played with < 10s left on the clock.
     # Engine users never get into time trouble because the engine is fast.
     # A surprisingly low time-pressure rate at lower ratings is a red flag.
+    #
+    # IMPORTANT: when clock annotations are absent (our current dataset has none),
+    # the loader falls back to tp_count=0 for every game. That makes time_pressure_rate
+    # uniformly 0.0 for ALL players — a completely uninformative feature that wastes a
+    # column in the model. We detect this and set to NaN so the coverage check in
+    # get_feature_matrix skips it automatically.
     if "total_time_pressure" in df.columns:
-        df["time_pressure_rate"] = df["total_time_pressure"] / df["n_games"].replace(0, np.nan)
+        if df["total_time_pressure"].sum() == 0:
+            df["time_pressure_rate"] = np.nan
+            logger.info(
+                "time_pressure_rate → NaN (no clock annotations in dataset; "
+                "all values would be 0.0 — feature skipped to avoid noise)"
+            )
+        else:
+            df["time_pressure_rate"] = df["total_time_pressure"] / df["n_games"].replace(0, np.nan)
     else:
         df["time_pressure_rate"] = np.nan
 
@@ -362,6 +433,30 @@ def get_feature_matrix(
         "performance_vs_actual",
         "underdog_win_rate",
     ]
+
+    # ── Conditional base features — strong signals, not universally available ──
+    # These require timestamps or Lichess-specific columns.  We include them when
+    # they have good coverage (>= 50%) and silently skip them otherwise.
+    # Unlike extended features, these don't require eval/clock annotations —
+    # just game metadata that some datasets have and some don't.
+    conditional_base = [
+        "rating_gain_rate",   # Elo gained per day — the clearest trajectory signal
+        "rating_gain",        # total Elo gained over observed period
+        "timeout_loss_rate",  # engine users never flag — Elo-independent signal
+    ]
+    for feat in conditional_base:
+        if feat in df.columns:
+            coverage = df[feat].notna().mean()
+            if coverage >= MIN_EVAL_COVERAGE:
+                features.append(feat)
+                logger.info(
+                    "Conditional feature '%s' included (coverage %.0f%%)", feat, coverage * 100
+                )
+            else:
+                logger.warning(
+                    "Conditional feature '%s' skipped — only %.0f%% coverage",
+                    feat, coverage * 100
+                )
 
     # ── Extended features (large Lichess dataset with clock / eval data) ──────
     # We only add an extended feature if it has coverage for at least MIN_EVAL_COVERAGE

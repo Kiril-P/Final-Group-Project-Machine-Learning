@@ -440,6 +440,8 @@ def _to_player_level_lichess(game_df: pd.DataFrame) -> pd.DataFrame:
         # Rating diff (white − black) — same sign convention as the small dataset.
         rating_diff = float(row.WhiteElo) - float(row.BlackElo)
 
+        termination = str(row.Termination) if hasattr(row, "Termination") else "Normal"
+
         base_record = {
             "id":               i,
             "turns":            turns,
@@ -453,11 +455,17 @@ def _to_player_level_lichess(game_df: pd.DataFrame) -> pd.DataFrame:
             "opening_ply":      opening_ply,
             "opening_eco":      str(row.ECO) if hasattr(row, "ECO") else "",
             "opening_name":     str(row.Opening) if hasattr(row, "Opening") else "",
-            "victory_status":   str(row.Termination) if hasattr(row, "Termination") else "",
+            "victory_status":   termination,
             "base_time_sec":    base_time,
             "increment_sec":    increment,
             "time_control_cat": str(row.time_control_cat),
             "rating_diff":      rating_diff,
+            # Game date — used to compute rating trajectory (first vs last observed rating).
+            # Stored as a string here; converted to datetime in aggregate_player_stats.
+            "game_date":        str(row.UTCDate) if hasattr(row, "UTCDate") else None,
+            # Whether this game ended in a time forfeit for the relevant player.
+            # Computed per-player below (who forfeited depends on color + winner).
+            "_termination":     termination,
         }
 
         for color, pid, p_rating, o_rating in [
@@ -467,16 +475,23 @@ def _to_player_level_lichess(game_df: pd.DataFrame) -> pd.DataFrame:
             won    = 1 if winner == color else 0
             result = 1.0 if winner == color else (0.5 if winner == "draw" else 0.0)
 
+            # Timeout loss: player lost AND the reason was running out of time.
+            # Engine users essentially never flag — they respond instantly.
+            # At any rating level a zero timeout-loss rate is suspicious.
+            is_timeout_loss = int(won == 0 and termination == "Time forfeit")
+
             move_stats = compute_game_stats(an, base_time, increment, color)
 
+            rec = {k: v for k, v in base_record.items() if k != "_termination"}
             records.append({
-                **base_record,
-                "player_id":      str(pid),
-                "player_rating":  float(p_rating),
-                "opponent_rating":float(o_rating),
-                "won":            won,
-                "result":         result,
-                "color":          color,
+                **rec,
+                "player_id":        str(pid),
+                "player_rating":    float(p_rating),
+                "opponent_rating":  float(o_rating),
+                "won":              won,
+                "result":           result,
+                "color":            color,
+                "is_timeout_loss":  is_timeout_loss,
                 **move_stats,
             })
 

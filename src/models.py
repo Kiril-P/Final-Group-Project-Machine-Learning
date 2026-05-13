@@ -25,6 +25,8 @@ from sklearn.svm import OneClassSVM
 from torch.utils.data import DataLoader, TensorDataset
 
 from src.config import (
+    AUTOENCODER_EVAL_FEATURES,
+    AUTOENCODER_EVAL_WEIGHT,
     AUTOENCODER_PARAMS,
     AUTOENCODER_SEARCH,
     AUTOENCODER_SEARCH_EPOCHS,
@@ -33,6 +35,7 @@ from src.config import (
     ISOLATION_FOREST_PARAMS,
     ISOLATION_FOREST_SEARCH,
     LOF_SEARCH,
+    MIN_GAMES_FOR_FLAG,
     MODELS_DIR,
     OCSVM_PARAMS,
     OCSVM_SEARCH,
@@ -250,7 +253,7 @@ class _AutoencoderNet(nn.Module):
 class AutoencoderDetector:
     """Reconstruction-error anomaly score; small feedforward net."""
 
-    def __init__(self, input_dim: Optional[int] = None, **kwargs):
+    def __init__(self, input_dim: Optional[int] = None, feature_names: Optional[list] = None, **kwargs):
         params = {**AUTOENCODER_PARAMS, **kwargs}
         self.encoding_dim = params["encoding_dim"]
         self.epochs = params["epochs"]
@@ -258,6 +261,8 @@ class AutoencoderDetector:
         self.lr = params["learning_rate"]
         self.threshold_pct = params["reconstruction_threshold_percentile"]
         self.input_dim = input_dim
+        self.feature_names = feature_names            # used to build per-feature weight vector
+        self._weight_vector: Optional[torch.Tensor] = None  # built in _build()
         self.model: Optional[_AutoencoderNet] = None
         self.threshold_: Optional[float] = None
         self.name = "Autoencoder"
@@ -267,6 +272,16 @@ class AutoencoderDetector:
     def _build(self, input_dim: int) -> None:
         self.input_dim = input_dim
         self.model = _AutoencoderNet(input_dim, self.encoding_dim).to(self.device)
+        # Build per-feature weight vector if feature names are available.
+        # Eval features get AUTOENCODER_EVAL_WEIGHT; all others get 1.0.
+        # Normalise so mean weight = 1.0 → loss scale is unchanged vs. plain MSE.
+        if self.feature_names is not None:
+            weights = [
+                AUTOENCODER_EVAL_WEIGHT if f in AUTOENCODER_EVAL_FEATURES else 1.0
+                for f in self.feature_names
+            ]
+            w = torch.tensor(weights, dtype=torch.float32, device=self.device)
+            self._weight_vector = w / w.mean()
 
     def fit(self, X: np.ndarray) -> "AutoencoderDetector":
         torch.manual_seed(RANDOM_SEED)
@@ -275,7 +290,11 @@ class AutoencoderDetector:
         dataset = TensorDataset(tensor)
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
-        criterion = nn.MSELoss()
+        criterion = nn.MSELoss()   # plain MSE for training — unweighted so the AE
+        # learns a faithful reconstruction of the full data manifold.  Eval-feature
+        # weighting is applied only at SCORING time (see _reconstruction_errors),
+        # which amplifies their contribution to the anomaly score without biasing
+        # the network weights toward over-fitting those features during training.
         self.model.train()
         for epoch in range(self.epochs):
             total_loss = 0.0
@@ -300,7 +319,10 @@ class AutoencoderDetector:
         tensor = torch.FloatTensor(X).to(self.device)
         with torch.no_grad():
             recon = self.model(tensor)
-            errors = ((recon - tensor) ** 2).mean(dim=1).cpu().numpy()
+            sq_err = (recon - tensor) ** 2
+            if self._weight_vector is not None:
+                sq_err = sq_err * self._weight_vector
+            errors = sq_err.mean(dim=1).cpu().numpy()
         return errors
 
     def score(self, X: np.ndarray) -> np.ndarray:
@@ -327,6 +349,7 @@ class AutoencoderDetector:
                 "input_dim": self.input_dim,
                 "encoding_dim": self.encoding_dim,
                 "threshold": self.threshold_,
+                "feature_names": self.feature_names,  # needed to rebuild weight vector on load
             },
             path,
         )
@@ -338,6 +361,8 @@ class AutoencoderDetector:
             checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         except TypeError:
             checkpoint = torch.load(path, map_location=self.device)
+        # Restore feature_names BEFORE _build() so the weight vector is reconstructed
+        self.feature_names = checkpoint.get("feature_names", None)
         self._build(checkpoint["input_dim"])
         assert self.model is not None
         self.model.load_state_dict(checkpoint["model_state_dict"])
@@ -630,4 +655,25 @@ def run_all_models(
     results["ensemble_flag"]      = results["anomaly_votes"] >= 2
     # All 3 agree — high precision shortlist (players most likely to be anomalous)
     results["ensemble_confident"] = results["anomaly_votes"] == 3
+
+    # ── Minimum game threshold — suppress flags for low-data players ──────────
+    # Players with fewer than MIN_GAMES_FOR_FLAG games have high-variance aggregated
+    # stats and produce false positives from statistical noise, not genuine anomaly.
+    # Empirically: median n_games for flagged players was 10 vs 29 for normal players;
+    # 416/915 flags had <10 games with the threshold disabled.
+    # We keep their scores/labels in the CSV for transparency but suppress the flags
+    # so they never appear in operational outputs.  They still contribute to model
+    # training as normal examples — having 8 games looks normal, which is correct.
+    if "n_games" in results.columns:
+        low_data = results["n_games"] < MIN_GAMES_FOR_FLAG
+        n_suppressed = int((low_data & results["ensemble_flag"]).sum())
+        results.loc[low_data, "ensemble_flag"]      = False
+        results.loc[low_data, "ensemble_confident"] = False
+        if n_suppressed:
+            logger.info(
+                "Suppressed %d flags for players with < %d games "
+                "(insufficient data for reliable scoring).",
+                n_suppressed, MIN_GAMES_FOR_FLAG,
+            )
+
     return results

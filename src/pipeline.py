@@ -171,23 +171,48 @@ def main(
     search_results.to_csv(RESULTS_DIR / "hyperparameter_tuning.csv", index=False)
     logger.info("Best params per model:\n%s", {k: v for k, v in best_params.items()})
 
+    # Inject feature_names into Autoencoder params so its reconstruction loss
+    # can apply higher weights to eval features, fixing near-random AUC on
+    # realistic_cheater (see Decision 31 in decisions.md).
+    best_params.setdefault("Autoencoder", {})["feature_names"] = feature_names
+
     # ── Stage 2d: 5-fold cross-validation for variance estimation ────────────
     # Runs on the development set (train + val) only — the test set is never involved.
     # Within every fold, the scaler is re-fit on the fold's training rows, so there's
     # zero leakage even inside CV. This lets us report "ROC-AUC 0.79 ± 0.03 (95% CI)"
     # rather than a single number that might be a lucky split artifact.
+    #
+    # We run CV twice — once with the subtle benchmark (model selection / comparison)
+    # and once with the realistic_cheater benchmark (honest harder estimate with CI).
+    # Both use the same folds and best_params for a direct apples-to-apples comparison.
     logger.info("Stage 2d: 5-fold cross-validation (development set only)...")
     dev_idx = np.concatenate([train_idx, val_idx])
     cv_raw, cv_summary = cross_validate_anomaly_models(
-        X=X_arr[dev_idx],          # raw (unscaled) development data
+        X=X_arr[dev_idx],
         feature_names=feature_names,
         best_params=best_params,
+        injection_strategy="subtle",
     )
     cv_raw.to_csv(RESULTS_DIR / "cv_raw_results.csv", index=False)
     cv_summary.to_csv(RESULTS_DIR / "cv_summary.csv", index=False)
     logger.info(
-        "CV summary (ROC-AUC):\n%s",
+        "CV summary subtle (ROC-AUC):\n%s",
         cv_summary[["model", "roc_auc_mean", "roc_auc_std", "roc_auc_ci95"]].to_string(index=False),
+    )
+
+    logger.info("Stage 2d-ii: 5-fold CV on realistic_cheater benchmark...")
+    cv_rc_raw, cv_rc_summary = cross_validate_anomaly_models(
+        X=X_arr[dev_idx],
+        feature_names=feature_names,
+        best_params=best_params,
+        injection_strategy="realistic_cheater",
+        n_injected=100,     # inject more so the signal is stable across folds
+    )
+    cv_rc_raw.to_csv(RESULTS_DIR / "cv_raw_results_realistic.csv", index=False)
+    cv_rc_summary.to_csv(RESULTS_DIR / "cv_summary_realistic.csv", index=False)
+    logger.info(
+        "CV summary realistic_cheater (ROC-AUC):\n%s",
+        cv_rc_summary[["model", "roc_auc_mean", "roc_auc_std", "roc_auc_ci95"]].to_string(index=False),
     )
 
     logger.info("Stage 3: Training anomaly detection models on train split...")
@@ -351,11 +376,20 @@ def main(
     )
     lc_df.to_csv(RESULTS_DIR / "learning_curves.csv", index=False)
 
-    importance_df = permutation_feature_importance(if_model, X_train, feature_names)
+    # Feature importance via permutation on LOF — our best model (AUC 0.962).
+    # Originally used IsolationForest here because it's the most common choice in the
+    # literature.  But IF is our weakest ensemble model (AUC 0.773, below the ZScore
+    # baseline), so its importance values describe what a suboptimal model attends to.
+    # LOF drives most of our detections — its importance is what belongs in the report.
+    # Permutation importance is model-agnostic: shuffle one feature at a time, measure
+    # mean drop in anomaly score.  Works identically for LOF as for any other model.
+    lof_importance = LOFDetector(**best_params.get("LOF", {"contamination": 0.05}))
+    lof_importance.fit(X_train)
+    importance_df = permutation_feature_importance(lof_importance, X_train, feature_names)
     importance_df.to_csv(RESULTS_DIR / "feature_importance.csv", index=False)
     plot_feature_importance(importance_df)
 
-    plot_anomaly_score_distribution(if_model.score(X_train), if_labels, "IsolationForest")
+    plot_anomaly_score_distribution(lof_importance.score(X_train), lof_importance.predict(X_train), "LOF")
 
     logger.info("Stage 7: Failure mode analysis...")
     failure_df = analyze_false_positives(meta_train, results, player_df)

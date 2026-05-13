@@ -66,6 +66,18 @@ RATING_BAND_LABELS = [
 # Minimum games per player before we trust their aggregated stats.
 # With fewer than 5 games, win rate and rating volatility are meaningless noise.
 MIN_GAMES_PER_PLAYER = 5
+
+# Minimum games before a player is eligible to be flagged by the ensemble.
+# With very few games, aggregated stats have high variance and produce false positives
+# purely from statistical noise — not from genuine anomalous behaviour.
+# Analysis on our dataset showed the median flagged player had only 10 games vs 29 for
+# normal players; 416/915 flags had <10 games. At 15 games the major noise source is
+# eliminated while retaining 71% of all players (12,738 out of 17,909).
+# Players below this threshold are still scored and stored in results CSVs — only their
+# ensemble_flag and ensemble_confident values are forced to False.  They still contribute
+# to model training as normal examples, which is correct: a player with 8 games looks
+# normal to the model (small sample), and that is fine.
+MIN_GAMES_FOR_FLAG = 15
 TIME_CONTROLS = ["blitz", "rapid", "classical", "bullet"]
 
 # ── Feature Engineering ─────────────────────────────────────────────────────
@@ -109,6 +121,26 @@ AUTOENCODER_PARAMS = {
     "learning_rate": 1e-3,
     "reconstruction_threshold_percentile": 95,  # flag top 5% highest reconstruction errors
 }
+
+# Eval features get extra weight in the AE reconstruction loss so that suspicious
+# eval signals aren't diluted by the many behavioral features sitting near zero.
+# Weight 3.0 means eval errors count 3× more; normalised so mean weight = 1.0,
+# which keeps loss scale and learning rate comparable to the unweighted baseline.
+AUTOENCODER_EVAL_WEIGHT: float = 3.0
+AUTOENCODER_EVAL_FEATURES: frozenset = frozenset({
+    "avg_acpl_band_z",
+    "avg_weighted_acpl_band_z",
+    "avg_acpl_middlegame_band_z",
+    "avg_acpl_opening_band_z",
+    "avg_acpl_endgame_band_z",
+    "acpl_consistency_band_z",
+    "acpl_phase_gap_band_z",
+    "blunder_rate",
+    "best_move_rate_band_z",
+    "comeback_rate",
+    "performance_vs_actual",
+    "underdog_win_rate",
+})
 
 N_SYNTHETIC_ANOMALIES = 50  # injected per evaluation run — enough signal without dominating the set
 ALPHA = 0.05                # significance level for statistical tests

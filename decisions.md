@@ -977,3 +977,336 @@ when coverage is ≥50%, given modest weight in the ensemble via the voting syst
 that requires ≥2 of 3 strong models to agree.
 
 ---
+
+## Decision 28 — Minimum Game Threshold for Flagging (15 games)
+
+**The problem we found:** After running the full pipeline, we checked the distribution
+of game counts between flagged and normal players:
+
+| Group | Median n_games |
+|---|---|
+| Not flagged (0 votes) | 29 |
+| Flagged (≥2 votes) | 10 |
+| Confident (3 votes) | 9 |
+
+416 out of 915 flagged players had fewer than 10 games. Spot-checking revealed why:
+a player with 7 games can have a 14% win rate, −255 performance vs actual, and
+still get flagged because the models score them as anomalous — but that's just
+statistical noise from a tiny sample, not evidence of cheating. With 7 games you
+cannot meaningfully estimate a player's ACPL consistency, comeback rate, or
+underdog win rate. Every aggregated feature has enormous variance.
+
+**The fix:** We added `MIN_GAMES_FOR_FLAG = 15` to config.py. Players below this
+threshold still:
+- Appear in all results CSVs (their scores and model labels are preserved)
+- Contribute to model training as "normal" examples
+- Have their individual model votes recorded (LOF_label, etc.)
+
+They just cannot have `ensemble_flag = True` or `ensemble_confident = True`. The
+ensemble suppression happens at the end of `run_all_models()` and is logged.
+
+**Why 15 specifically:** At threshold 15:
+
+| Threshold | Players kept | Flagged remain | Confident remain |
+|---|---|---|---|
+| 10 | 14,985 (84%) | 499 / 915 (55%) | 101 / 228 (44%) |
+| **15** | **12,738 (71%)** | **331 / 915 (36%)** | **71 / 228 (31%)** |
+| 20 | 10,837 (61%) | 240 / 915 (26%) | 56 / 228 (25%) |
+
+15 games sits at the population median (p50 = 16 games). Below the median,
+aggregated stats are unreliable for any player. Above it, there's enough data
+for at least 3–4 weeks of play history. Threshold 20 would drop 40% of all
+players; threshold 10 still lets most noise through.
+
+**What this means for the final numbers:** 331 flagged players (vs 915 before),
+71 confident (vs 228 before). The reduction is large but correct — the flagged
+list is now composed of players with enough game history to make the anomaly
+score meaningful.
+
+---
+
+## Decision 29 — Recall@k on Realistic Cheater Benchmark: An Honest Limitation
+
+**What the numbers showed:**
+
+| Model | realistic_cheater AUC | realistic_cheater Recall@k |
+|---|---|---|
+| LOF | 0.750 | 0.01 |
+| OC-SVM | 0.682 | 0.00 |
+| Autoencoder | 0.520 | 0.00 |
+
+AUC 0.750 means LOF ranks realistic cheaters in roughly the 65th–75th percentile
+of its anomaly score distribution — it has real ranking power. But Recall@k = 0.01
+means when you look at only LOF's top-k flagged players (k = 100, the number of
+synthetic anomalies injected), only 1 of the 100 synthetic cheaters appears there.
+
+These two numbers are not contradictory. The AUC measures the full ranking; Recall@k
+measures only the very top of it. For a model with AUC 0.750, cheaters end up
+around the 75th percentile of anomaly scores — well above the median normal player,
+but not at the extreme top where the flagging threshold sits.
+
+**What this means in practice:** Our 331 flagged players (after the minimum game
+threshold) are not primarily catching the realistic cheater profile. They're catching
+players who are extreme across many features simultaneously — which is a different
+and arguably more obvious signal. Sophisticated cheaters who deliberately keep
+behavioral features normal would mostly land in the 1-vote or unflagged zones.
+
+**Why we can't fix this without labeled data:** The ensemble's flagging threshold
+is calibrated to the contamination rate (5%), not to the realistic cheater profile
+specifically. To push realistic cheaters into the top-k, we'd need to either:
+1. Lower the flagging threshold dramatically (but that floods the list with false positives), or
+2. Train specifically on confirmed realistic cheater examples (but we have no labels)
+
+This is an honest limitation of unsupervised anomaly detection. The system is best
+understood as a triage tool that catches the most obvious outliers — not a definitive
+detector of sophisticated cheating. Documented in the Core Limitation section.
+
+---
+
+## Decision 30 — Feature Importance: IsolationForest → LOF
+
+**Original setup:** Feature importance was computed via permutation on IsolationForest,
+because IF is the most commonly used model for permutation importance in the anomaly
+detection literature, and we followed that convention initially.
+
+**The problem:** IsolationForest is our weakest ensemble model — AUC 0.773 on the
+subtle benchmark, below the ZScore univariate baseline (0.781). Reporting importance
+based on IF means we're explaining what a suboptimal model pays attention to, not
+what drives our actual detections. The report should reflect which features matter
+to the model that's actually doing most of the work.
+
+**The fix:** Permutation importance is model-agnostic — the algorithm (shuffle one
+feature, measure mean drop in anomaly score) works identically regardless of which
+model you use. We simply swapped the model argument from `if_model` to a newly
+fitted `lof_importance` instance in Stage 6 of the pipeline.
+
+**What changes:** `feature_importance.csv` and the importance bar chart now reflect
+LOF's sensitivity to each feature. The anomaly score distribution plot (previously
+labelled "IsolationForest") now uses LOF scores and is labelled accordingly.
+
+**A note on interpretation:** Permutation importance for an unsupervised model
+measures which features LOF is *most sensitive to*, not which features are most
+correlated with real cheating. If shuffling a feature dramatically changes LOF's
+anomaly scores, that feature is shaping its decisions. This is a model-specific
+measure — a different model might rank features differently. We note this
+distinction in any discussion of the importance results.
+
+**What the LOF importance actually showed (and why it makes sense):**
+
+The top three features by importance turned out to be behavioral, not eval:
+
+| Rank | Feature | Importance |
+|---|---|---|
+| 1 | victory_efficiency | −0.085 |
+| 2 | avg_turns | −0.080 |
+| 3 | opening_ply_ratio | −0.076 |
+| 4 | avg_acpl_middlegame_band_z | −0.072 |
+| 5 | acpl_phase_gap_band_z | −0.066 |
+
+This is counterintuitive at first — we'd expect ACPL features to dominate.
+But it makes sense for LOF specifically. LOF detects anomalies by measuring
+local density: a player is anomalous if their neighbors in feature space are
+far away. Behavioral features (game length, opening style, win efficiency)
+cluster players very tightly — players with similar styles and time controls
+share very similar values. When you shuffle these features, you break those
+tight clusters and many normal players suddenly have no natural neighbors,
+which dramatically inflates the average anomaly score.
+
+Eval features (ACPL, best move rate) also cluster players but with more spread
+— there's genuine variance in accuracy even among players of the same style.
+They appear at ranks 4–8, still clearly important, but secondary to the
+behavioral structure that defines LOF's neighborhoods.
+
+The practical implication: LOF's anomaly detections are anchored to "this player
+looks different from everyone who plays similarly to them." A cheater who plays
+a very common style (standard openings, typical game lengths) but has suspicious
+ACPL would still be caught, because within their behavioral peer group they're an
+outlier on the eval dimensions. This is exactly the right detection logic.
+
+---
+
+## Decision 31 — Autoencoder Limitation on Realistic Cheater Detection
+
+**Problem investigated:** The Autoencoder scored AUC ~0.50 (essentially random) on the
+`realistic_cheater` benchmark, despite AUC 0.92 on the `subtle` benchmark. We
+investigated whether this was fixable.
+
+**Root cause (fundamental, not a bug):**
+
+The `realistic_cheater` profile places eval features at p3–10 (suspicious low) or
+p86–95 (suspicious high) of the normal player distribution. Crucially, 3–10% of
+LEGITIMATE normal players also sit at those extreme percentiles — they are just the
+genuinely strong (or weak) players in their rating band.
+
+The AE is trained on ~12,500 normal players. It learns to reconstruct the full
+distribution, including legitimate players at extreme eval percentiles. When a synthetic
+cheater arrives with the same eval values, the AE reconstructs those values correctly
+(it has seen them in training). The reconstruction error is LOW — even lower than for
+many normal players who have moderate variance across ALL 21 features:
+
+```
+Cheater: 9 behavioral at 0 (perfect reconstruction) + 12 eval at extreme (AE reconstructs well)
+→ Total error ≈ 0.11  (LOWER than typical normal player at 0.15)
+```
+
+This gives AUC < 0.5 — cheaters are actually ranked as LESS anomalous than many normals.
+
+**Approaches tried:**
+
+| Approach | Realistic_cheater AUC | Subtle AUC | Verdict |
+|---|---|---|---|
+| Original unweighted | ~0.50 | ~0.92 | Baseline |
+| Weighted training + scoring (3× eval) | 0.54 | 0.94 | Training weights make AE reconstruct eval better → hurts |
+| Score-only weighting (3× eval at scoring) | ~0.50 | 0.92 | Neutral — doesn't help |
+| enc=1 (maximum compression) | 0.60 | TBD | Marginal improvement — not worth tradeoff |
+
+**Why nothing works:** Reconstruction-based anomaly detection requires the feature
+combination to be UNUSUAL in a way the AE cannot reconstruct. For realistic cheaters:
+- Behavioral features at mean → always easy to reconstruct
+- Eval features at extreme values → the AE has seen those values from genuine outlier players
+- The combination is not unusual enough to stand out from legitimate extreme players
+
+No amount of loss weighting changes this — it's a limitation of the model family, not
+the implementation.
+
+**What was actually implemented:**
+The score-only weighting infrastructure was kept in place:
+- `AutoencoderDetector` now accepts `feature_names: Optional[list] = None`
+- A weight vector is built in `_build()` using `AUTOENCODER_EVAL_FEATURES` from config
+- Eval features get 3× weight in `_reconstruction_errors()` only (training uses plain `nn.MSELoss()`)
+- `pipeline.py` injects `feature_names` into `best_params["Autoencoder"]` after search
+- `save()`/`load()` persist `feature_names` so a loaded model retains the weighting
+
+The infrastructure is correct and forward-compatible, even though it doesn't improve
+realistic_cheater AUC meaningfully on this dataset.
+
+**Operational impact:** The AE is NOT used for realistic_cheater detection in the
+ensemble. The ensemble (LOF + OC-SVM + AE) relies on LOF (AUC 0.75) and OC-SVM
+(AUC 0.68) for that benchmark. The AE contributes its strongest signal on the
+`subtle` benchmark (AUC 0.92), which covers a genuinely different anomaly pattern:
+multiple features perturbed simultaneously, staying on the data manifold.
+
+**Why the CV result looks better than the holdout (0.748 vs 0.499):**
+
+This apparent contradiction has a simple explanation. Cross-validation uses a
+fast 30-epoch AE (to keep CV runtime practical). The final holdout uses 100 epochs.
+
+More training makes the AE a *better reconstructor* — it learns to accurately reproduce
+a wider range of patterns, including the unusual eval values that suspicious players
+have. A better reconstructor assigns lower anomaly scores to cheaters, because it can
+reconstruct their patterns correctly. The 30-epoch AE hasn't fully learned those
+patterns yet, so unusual eval values still produce visible reconstruction errors.
+
+In short: for this specific benchmark, less training = better detection. But we cannot
+choose the epoch count by observing the holdout result — that would be test-set leakage.
+The hyperparameter search (which ran on subtle anomalies) found 100 epochs as optimal.
+That result stands. The CV vs holdout discrepancy is documented here for transparency,
+not hidden.
+
+**With more time:** A conditional generative model (e.g., VAE conditioned on behavioral
+features predicting eval features) would solve this — it would flag when eval features
+DON'T MATCH the behavioral profile, rather than flagging unusual reconstruction of eval
+features in isolation. This is architecturally out of scope for this project.
+
+---
+
+## Decision 32 — Weighted Ensemble (Considered, Not Implemented)
+
+**The idea:** The current ensemble gives each of the three voters (LOF, OC-SVM, AE)
+one equal vote. But their AUC scores are not equal:
+
+| Model | Subtle AUC | Realistic_cheater AUC |
+|---|---|---|
+| LOF | 0.962 | 0.750 |
+| OC-SVM | 0.892 | 0.682 |
+| Autoencoder | 0.923 | 0.499 |
+
+The proposal was to weight votes proportionally to realistic_cheater AUC (the harder
+benchmark), so LOF's vote counts ~1.5× more than OC-SVM's, and the AE's near-zero
+performance on that benchmark is reflected.
+
+**Why we didn't implement it:**
+
+1. **Marginal gain in practice.** The unweighted ensemble already has the right
+   dynamics for realistic cheater detection: LOF and OC-SVM both fire (AUC 0.75 and
+   0.68), so they naturally agree when it matters. The AE contributes noise at ~0.5
+   AUC, but with ≥2 votes required for `ensemble_flag`, the AE can't override two
+   agreeing models — it can only add a third vote where LOF and OC-SVM already agree.
+
+2. **The AE's 0.499 AUC is symmetric noise.** An AUC of exactly 0.50 means the model
+   is a coin flip, so its expected contribution to correct votes = expected contribution
+   to incorrect votes = 0. Downweighting it from 1 to 0.499 changes almost nothing.
+
+3. **Weighting introduces a free parameter that needs justification.** Using realistic_
+   cheater AUC as the weight is circular: we'd be using a benchmark-specific AUC to
+   tune ensemble weights, then reporting performance on that same benchmark. This is
+   valid but creates an implicit bias we can't easily separate from genuine improvement.
+
+4. **The subtle benchmark is our primary use case.** For subtle multi-feature anomalies
+   (which is what the system is actually designed to detect), the AE is genuinely
+   strong (AUC 0.923). Down-weighting it there would hurt performance on the benchmark
+   that actually matches our system design.
+
+**Conclusion:** Equal weighting is the simpler, more interpretable, and empirically
+competitive choice. If we had a larger labelled dataset to tune weights properly, a
+weighted ensemble would be worth revisiting.
+
+---
+
+## Decision 33 — Qualitative Spot-Check of Top Flagged Players
+
+We manually inspected the top 15 players from the 50 `ensemble_confident` flags
+(all three voters agreed). The goal: verify the system is finding real signal, not just
+statistical noise from low game counts.
+
+**What we found:**
+
+The 15 players split into two clearly distinct anomaly profiles — not one:
+
+**Profile A — Upward suspicious (potential engine users / account boosters):**
+
+- **texanguy** (2183 Elo, 20 games): 100% win rate, best_move_rate in top 2% of their
+  band, rating gained ×10 in 20 games. The clearest engine-user signal in the dataset.
+- **Giuseppe-Michele** (2126 Elo, 22 games): 77% win rate, rating growing at ×35 per
+  game. Playing at 2000+ with near-perfect record in a short burst — classic account
+  hand-off or engine assistance on selected games.
+- **Alboio** (1938 Elo, 21 games): 86% win rate, ×34 rating gain rate, wins 33% of
+  positions where it was losing. High performance across multiple independent signals.
+- **pexon77** (1840 Elo, 50 games): 68% win rate, ACPL z-score +3.5 (worst-in-band
+  accuracy, yet winning at a high rate — inconsistency consistent with selective engine use).
+
+**Profile B — Downward suspicious (potential sandbagging / account farming):**
+
+- **h-as-n** (1023 Elo, 28 games): 3.6% win rate with −50 Elo/game rating trajectory.
+  Deliberately losing at a rate that exceeds random chance — statistical signature of
+  intentional sandbagging.
+- **kysolnia** (1147 Elo, 25 games): 16% win rate, −108 Elo per game. The most extreme
+  downward trajectory in the dataset. Unusual ACPL patterns suggest inconsistent effort.
+- **Ybelskiy** (1817 Elo, 24 games): Low win rate (46%) but beats opponents rated
+  significantly higher — losing rating while selectively winning specific games.
+
+**Profile C — Inconsistent accuracy (phase-based anomalies):**
+
+- **Geraltz**, **nikolayr**, **lolo2015**, **yvanno135**, **kysolnia**: Flagged
+  primarily for ACPL consistency or acpl_phase_gap — they play at very different
+  accuracy levels in opening, middlegame, and endgame. Legitimate players show smooth
+  accuracy across phases; these players have phase gaps 2–4σ above their rating band.
+  This can indicate: using an engine for specific phases (openings or endgames only),
+  playing certain positions from memory vs. calculating others, or simply noisy data
+  from a small sample.
+
+**Standout case — cuprite** (1620 Elo, 67 games): comeback_rate = 1.000 over 67 games.
+This player won 100% of the games in which they were in a losing position at some point.
+With 67 games this is a robust sample, not a small-sample artefact. Even elite players
+cannot sustain a 100% comeback rate — the statistical likelihood of this occurring by
+chance is essentially zero.
+
+**Key insight:** The system is not just catching "cheaters" — it is catching
+*behaviorally anomalous players broadly*. This includes upward cheating (engine use,
+account boosting), downward cheating (sandbagging, farming lower-rated players), and
+inconsistent play patterns (selective engine use, memory-based play in openings).
+This is the correct behaviour for an unsupervised anomaly detector with no ground-truth
+labels: it surfaces the most unusual players, and the human reviewer then categorises
+what kind of anomaly each one represents.
+
+---

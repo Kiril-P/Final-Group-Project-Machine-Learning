@@ -20,7 +20,14 @@ from sklearn.preprocessing import StandardScaler
 from src.config import DATA_LICHESS, LICHESS_SAMPLE_N, LICHESS_TIME_CONTROLS, RANDOM_SEED, RESULTS_DIR
 from src.data_loader import load_and_prepare
 from src.lichess_loader import load_and_prepare_lichess
-from src.features import aggregate_player_stats, add_engineered_features, get_feature_matrix
+from src.features import (
+    aggregate_player_stats,
+    add_engineered_features,
+    get_feature_matrix,
+    BAND_Z_PAIRS,
+    compute_band_stats,
+    reapply_band_zscores,
+)
 from src.interpretation import (
     analyze_false_positives,
     generate_player_explanations,
@@ -32,6 +39,7 @@ from src.interpretation import (
     plot_umap,
 )
 from src.models import (
+    ACPLSubAutoencoder,
     AutoencoderDetector,
     HDBSCANDetector,
     IsolationForestDetector,
@@ -112,9 +120,6 @@ def main(
     feature_names = list(X_raw.columns)
     X_arr = X_raw.values
 
-    agg.to_csv(RESULTS_DIR / "player_features.csv", index=False)
-    logger.info("Saved player features to %s", RESULTS_DIR / "player_features.csv")
-
     # ── Stage 2a: 70 / 15 / 15 train / val / test split ────────────────────
     # 70% train: models learn from this.
     # 15% val: used for hyperparameter search and model selection (never in final numbers).
@@ -145,6 +150,40 @@ def main(
         len(X_train), len(X_val), len(X_test),
     )
 
+    # ── Stage 2e: Recompute band z-scores using training players only ─────────
+    # add_engineered_features() above computed band means/stds from the full
+    # population (all 28k players), so test-set distribution information
+    # contaminated the normalisation.  Now that we have the split, we recompute
+    # the stats from training players only and propagate corrected values back
+    # into X_arr before refitting the scaler.
+    logger.info("Stage 2e: Recomputing band z-scores from training split only...")
+    train_pids = set(meta.iloc[train_idx]["player_id"])
+    band_stats = compute_band_stats(agg[agg["player_id"].isin(train_pids)])
+    agg = reapply_band_zscores(agg, band_stats)
+
+    agg_indexed = agg.set_index("player_id")
+    for _raw_feat, z_feat in BAND_Z_PAIRS:
+        if z_feat not in feature_names:
+            continue
+        col_idx = feature_names.index(z_feat)
+        for row_i, pid in enumerate(meta["player_id"]):
+            if pid in agg_indexed.index:
+                val = agg_indexed.at[pid, z_feat]
+                if pd.notna(val):
+                    X_arr[row_i, col_idx] = float(val)
+
+    # Refit scaler on the corrected X_arr (train partition only, as before).
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_arr[train_idx])
+    X_val   = scaler.transform(X_arr[val_idx])
+    X_test  = scaler.transform(X_arr[test_idx])
+    logger.info("Stage 2e complete — band z-scores now derived from training players only.")
+
+    # Save player features after band z-scores have been corrected to train-only stats,
+    # so the CSV matches what the models actually see.
+    agg.to_csv(RESULTS_DIR / "player_features.csv", index=False)
+    logger.info("Saved player features to %s", RESULTS_DIR / "player_features.csv")
+
     # ── Stage 2c: Multi-parameter random search on the validation set ────────
     # We inject synthetic anomalies into the val split to get labelled data for
     # hyperparameter optimisation. Without ground-truth cheater labels, this is the
@@ -171,10 +210,9 @@ def main(
     search_results.to_csv(RESULTS_DIR / "hyperparameter_tuning.csv", index=False)
     logger.info("Best params per model:\n%s", {k: v for k, v in best_params.items()})
 
-    # Inject feature_names into Autoencoder params so its reconstruction loss
-    # can apply higher weights to eval features, fixing near-random AUC on
-    # realistic_cheater (see Decision 31 in decisions.md).
+    # Inject feature_names so both AE variants can identify ACPL columns.
     best_params.setdefault("Autoencoder", {})["feature_names"] = feature_names
+    best_params.setdefault("ACPLSubAutoencoder", {})["feature_names"] = feature_names
 
     # ── Stage 2d: 5-fold cross-validation for variance estimation ────────────
     # Runs on the development set (train + val) only — the test set is never involved.
@@ -262,6 +300,8 @@ def main(
              AutoencoderDetector(input_dim=X_train.shape[1], **p), "Autoencoder"),
         (lambda p=best_params.get("HDBSCAN", {"min_cluster_size": 15}):
              HDBSCANDetector(**p), "HDBSCAN"),
+        (lambda p=best_params.get("ACPLSubAutoencoder", {}):
+             ACPLSubAutoencoder(**p), "ACPLSubAutoencoder"),
     ]
 
     # Stage 4a: Validation set evaluation (used for model comparison / selection)

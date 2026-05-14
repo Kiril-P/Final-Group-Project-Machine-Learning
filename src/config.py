@@ -120,6 +120,9 @@ AUTOENCODER_PARAMS = {
     "batch_size": 64,
     "learning_rate": 1e-3,
     "reconstruction_threshold_percentile": 95,  # flag top 5% highest reconstruction errors
+    # Top-k mean scoring: set to 0 to use plain mean (current behaviour).
+    # k>0 was evaluated empirically (k=3) and reverted — see Decision 36 in decisions.md.
+    "scoring_top_k": 0,
 }
 
 # Eval features get extra weight in the AE reconstruction loss so that suspicious
@@ -140,6 +143,24 @@ AUTOENCODER_EVAL_FEATURES: frozenset = frozenset({
     "comeback_rate",
     "performance_vs_actual",
     "underdog_win_rate",
+})
+
+# Pure chess-accuracy features used by ACPLSubAutoencoder.
+# Subset of AUTOENCODER_EVAL_FEATURES: strictly move-quality signals (ACPL variants,
+# blunder rate, best-move rate).  Outcome-based signals (comeback_rate,
+# performance_vs_actual, underdog_win_rate) are excluded because they can reflect
+# legitimate skill rather than engine assistance and would dilute the sub-model's
+# focused accuracy signal.
+ACPL_SUB_FEATURES: frozenset = frozenset({
+    "avg_acpl_band_z",
+    "avg_weighted_acpl_band_z",
+    "avg_acpl_middlegame_band_z",
+    "avg_acpl_opening_band_z",
+    "avg_acpl_endgame_band_z",
+    "acpl_consistency_band_z",
+    "acpl_phase_gap_band_z",
+    "blunder_rate",
+    "best_move_rate_band_z",
 })
 
 N_SYNTHETIC_ANOMALIES = 50  # injected per evaluation run — enough signal without dominating the set

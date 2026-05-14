@@ -1310,3 +1310,249 @@ labels: it surfaces the most unusual players, and the human reviewer then catego
 what kind of anomaly each one represents.
 
 ---
+
+## Decision 34 — Fix band z-score leakage: compute stats from training players only
+
+**Context:** Band z-scores for ACPL features (`avg_acpl_band_z`, `best_move_rate_band_z`,
+and six others) were previously computed inside `add_engineered_features()`, which runs
+on the full population before the train/val/test split. The within-band means and stds
+therefore incorporated information from validation and test players, constituting a form
+of data leakage. An earlier comment argued this was acceptable because the stats are
+"contextual" rather than "learned model parameters"; on reflection that argument does not
+hold — any statistics derived from held-out data and used to transform features seen by
+the model violate the principle of evaluating on truly unseen data.
+
+**Fix:** Extracted the band z-score logic into two reusable functions in `src/features.py`:
+- `compute_band_stats(df)` — builds `{raw_feat: {band: (mean, std)}}` from any player subset.
+- `reapply_band_zscores(df, band_stats)` — overwrites `*_band_z` columns using pre-computed stats.
+
+`add_engineered_features()` now calls these internally (same output for notebooks and
+quick-run mode). In `src/pipeline.py`, Stage 2e recomputes band stats from training
+players only, then propagates the corrected values back into `X_arr` and refits the
+`StandardScaler`. Validation and test splits therefore receive band-normalised features
+whose reference distribution comes exclusively from the training set.
+
+**Impact:** Negligible numerical change for large, balanced rating bands (band stats
+are stable), but removes a legitimate methodological objection. The fix adds ~30 lines
+to the pipeline and is fully backwards-compatible with notebook usage.
+
+---
+
+## Decision 35 — Clarify Recall@k: k equals n_synthetic, not a fixed cutoff
+
+**Context:** `evaluate_injection_recovery()` set `k = int(y_true.sum())` (= number of
+injected anomalies), so `recall_at_k` measures "what fraction of the injected anomalies
+appear in the model's top-k predictions?" However the log string read `R@{k}` with no
+annotation, making it easy to misread as a fixed-cutoff recall. For the
+realistic_cheater benchmark with 100 injected anomalies this produced `Recall@100 = 0.01`,
+which looks catastrophically bad if misread as "only 1 anomaly found in the top 100
+ranked players" rather than "the model recovered 1 of 100 hard-to-detect synthetic
+cheaters in a pool of 28k players."
+
+**Fix:** In `evaluate_injection_recovery()`:
+1. Added `"k_used": k` to the results dict so every CSV row is self-documenting.
+2. Rewrote the log line to include `k=n_synthetic=` explicitly and to surface Average
+   Precision (AP) every time, since AP is robust to the choice of k and is the primary
+   ranking metric for the realistic_cheater benchmark.
+3. Added a docstring explaining that k = n_synthetic and that AP should be read as the
+   primary metric.
+
+**Report guidance:** When reporting realistic_cheater results, lead with Average Precision
+and ROC-AUC. Present `Recall@k (k = n_synthetic = 100)` as a secondary illustration
+with the explicit caveat that recovering hard-to-detect anomalies from a 28k-player pool
+is a deliberately stringent test. The AP score is a more interpretable summary of ranking
+quality than a single recall value at one cutoff.
+
+---
+
+## Decision 36 — Top-k mean scoring for the Autoencoder: evaluated and reverted
+
+**Hypothesis:** The standard AE dilutes the ACPL cheating signal by averaging
+reconstruction error equally across all 14 features.  A sophisticated cheater keeps
+behavioural features at the population mean, producing near-zero errors on those
+dimensions that wash out the ACPL error.  Averaging only the k=3 worst-reconstructed
+features (after the 3× ACPL weight is applied) should amplify the signal.
+
+**Empirical result (Lichess extended dataset, holdout test set):**
+
+| Benchmark | AE before (mean) | AE after (top-k=3) |
+|---|---|---|
+| subtle | 0.933 | 0.907 |
+| realistic_cheater | 0.474 | 0.449 |
+
+Both benchmarks regressed.  The top-k change was reverted (`scoring_top_k = 0`).
+
+**Why it failed:** Legitimate players naturally occupy the tails of individual feature
+distributions — a strong player can have low ACPL band-z by skill alone.  Top-k scoring
+elevates those players' scores for the wrong reason, increasing false positives and
+reducing AUC.  The dilution problem is real, but top-k is too blunt a solution: it
+amplifies all extreme features equally regardless of whether the extremity is suspicious
+in context.  What makes a realistic cheater suspicious is not that any single feature
+is extreme, but that ACPL is extreme *while all behavioural features are simultaneously
+normal* — a joint distributional anomaly that scoring tricks on individual features
+cannot capture.
+
+**Conclusion:** The `scoring_top_k` parameter remains in the codebase with value 0
+(disabled) so the reasoning and experiment are preserved.  Decision 40 explains why
+this joint-distribution detection problem is inherent to all AE variants on this
+dataset.
+
+---
+
+## Decision 37 — ACPLSubAutoencoder: evaluated and retained as a negative-result model
+
+**Hypothesis:** Training an AE exclusively on the 9 chess-accuracy features (ACPL
+variants, blunder rate, best-move rate) would remove the dilution from behavioural
+features entirely.  The 9 accuracy features have strong internal correlations for
+normal players; an engine user breaks all of them simultaneously in a distinctive way.
+
+**Empirical result (Lichess extended dataset, holdout test set):**
+
+| Benchmark | Standard AE | ACPLSubAutoencoder |
+|---|---|---|
+| subtle | 0.933 | 0.798 |
+| realistic_cheater | 0.474 | 0.363 |
+
+The sub-model performs worse than the standard AE on both benchmarks.
+
+**Why it failed:**
+
+- *Subtle benchmark:* The subtle injection perturbs roughly 1/3 of all 14 features at
+  random, not specifically ACPL ones.  The sub-AE sees only 9 features, so on average
+  it observes ~3 perturbations per player instead of ~4.7.  Less signal = lower AUC.
+
+- *Realistic_cheater benchmark:* This reveals a more fundamental limitation.  Players
+  at the 3rd–10th percentile of ACPL *naturally exist* in the training data; they are
+  just legitimately accurate players.  The sub-AE has seen them during training and
+  reconstructs them well.  What makes the realistic cheater suspicious is not low ACPL
+  alone, but low ACPL *combined with perfectly normal behavioural features at the
+  same time* — a combination that is rare in the full 14-dimensional joint distribution
+  but undetectable by a model that never sees the behavioural features at all.
+
+**Retained as a tracking model:** `ACPLSubAutoencoder` remains in `run_all_models` and
+all evaluation CSVs.  Its consistent underperformance corroborates the conclusion in
+Decision 40: the AE family's weakness on realistic_cheater is architectural, not
+fixable by feature sub-setting or scoring adjustments.  See Decision 40.
+
+---
+
+## Decision 38 — Semi-supervised AE not implemented (Fix 4, considered and rejected)
+
+**What it would do:** During AE training, inject synthetic anomaly profiles and add a
+contrastive term that penalises the model for reconstructing them well.  The AE would
+learn to specifically fail at reconstructing known cheating profiles, directly
+increasing its score on those patterns.
+
+**Why we rejected it:**
+
+The project's core methodological claim is unsupervised anomaly detection — the models
+surface statistical outliers without any prior assumption about what cheating looks
+like.  Injecting synthetic profiles into training destroys this guarantee: the model
+no longer finds "unusual patterns" in general, it finds patterns that resemble our
+hand-crafted synthetic templates.
+
+More concretely, our synthetic profiles are approximations grounded in the literature
+(Regan 2011, Guid & Bratko 2006) but are not ground truth.  If a real cheating
+pattern differs from our templates — because, for example, the player uses a different
+engine-consultation strategy or belongs to a rating band we modelled poorly — the
+semi-supervised AE will miss them precisely because it was tuned against other
+profiles.  We would be trading broad statistical sensitivity for narrow template
+specificity.
+
+There is also an evaluation integrity issue: to avoid measuring in-distribution
+memorisation, training and evaluation would need to use strictly different injection
+strategies (e.g. train on `subtle`, evaluate on `realistic_cheater`).  This changes
+the validation framework, makes cross-model comparisons less clean, and requires
+justifying that the two strategies are genuinely distinct enough that good performance
+on the evaluation strategy cannot be achieved simply by memorising the training one.
+
+The fixes in Decisions 36 and 37 address the same underlying problem (ACPL signal
+dilution) without modifying the unsupervised learning objective.
+
+---
+
+## Decision 39 — Variational Autoencoder not implemented (Fix 5, considered and rejected)
+
+**What it would do:** Replace the standard AE with a VAE that learns a probabilistic
+latent space.  Anomaly score = reconstruction error + KL divergence (how far the
+player's encoding deviates from the normal prior).  The KL term would catch players
+whose latent representation is unusual even if their reconstruction error is low.
+
+**Why we rejected it:**
+
+VAEs earn their complexity in high-dimensional spaces (images, sequences, text) where
+the data manifold is genuinely non-linear and the KL regularisation is needed to
+impose structure on the latent space.  With 14 tabular features and a proper
+StandardScaler, the data manifold is already relatively simple.  The evidence for this
+is the performance of LOF (AUC 0.973): if the manifold were too complex for
+distance-based methods, LOF would not work so well.
+
+More importantly, the diagnostic problem here is not "the latent space lacks
+structure" — it is "the scoring function dilutes the ACPL signal."  Decisions 36
+and 37 address that directly.  A VAE would add a probabilistic prior on the latent
+space, which does not solve a signal-dilution problem; it solves a distributional
+representation problem that is not the bottleneck.
+
+There is also a documented failure mode on small tabular datasets: posterior collapse,
+where the KL term dominates early in training and all encodings converge toward the
+prior regardless of input.  The result is that reconstruction error becomes the only
+informative component of the score — identical to the standard AE — but with added
+architectural complexity and training instability.  Addressing this requires KL
+annealing schedules and β-VAE tuning, which introduces hyperparameters that cannot be
+meaningfully searched without ground-truth labels.
+
+---
+
+## Decision 40 — The AE family's weakness on realistic_cheater is architectural, not a tuning problem
+
+**Finding:** After empirically evaluating top-k mean scoring (Decision 36) and a
+dedicated ACPL sub-space model (Decision 37), both of which regressed rather than
+improved, we conclude that the Autoencoder's near-random AUC (~0.45–0.47) on the
+realistic_cheater benchmark reflects a fundamental architectural mismatch rather than
+a fixable hyperparameter or feature-engineering issue.
+
+**The root cause:**
+
+A reconstruction-based anomaly detector scores a player highly when the network
+*cannot* reproduce their feature values from the patterns it learned during training.
+The realistic_cheater synthetic profile places ACPL features at the 3rd–10th percentile
+of their rating band — but real players at those percentiles exist in the training data
+(they are just legitimately accurate).  The network has learned to reconstruct
+"low-ACPL players" and does so without error.
+
+What makes the realistic cheater suspicious is not any single feature value but the
+*joint combination*: ACPL features are simultaneously better than normal while all
+behavioural features (game length, opening variety, time usage) are precisely at the
+population mean.  This combination is statistically rare in the 14-dimensional joint
+distribution — but an AE does not model joint rarity.  It models feature-wise
+reconstruction fidelity.  No scoring trick (top-k, feature weighting, sub-space
+restriction) changes this: the problem is that the AE's inductive bias is mismatched
+to the detection task on this benchmark.
+
+**Why LOF succeeds where AEs fail:**
+
+LOF (AUC 0.740 on realistic_cheater) measures local density in the full joint feature
+space.  A player with ACPL at the 5th percentile and behavioural features all at the
+50th percentile occupies a sparse region of the joint distribution — few genuine
+players combine very high accuracy with exactly median behaviour across every other
+dimension.  LOF detects this joint sparsity directly.  This is the right inductive
+bias for detecting sophisticated cheaters who are careful to normalise their behaviour
+outside the accuracy domain.
+
+**Implications for the ensemble and report:**
+
+The Autoencoder remains in the ensemble because it provides genuine complementary
+signal on the subtle benchmark (AUC 0.933) — it catches a different subset of
+anomalous players than LOF does (model agreement analysis shows ~30% overlap).  Its
+role is not to detect sophisticated cheaters who deliberately mask their behaviour;
+it is to catch players with broadly unusual feature profiles across the full feature
+space, a task for which reconstruction error is well-suited.
+
+The realistic_cheater benchmark AUC of ~0.47 should be reported honestly in the final
+report alongside the CV mean of 0.69 ± 0.09 and the explanation above.  The gap
+between the holdout single-split result and the CV mean reflects genuine variance on
+a hard benchmark rather than overfitting — the AE's performance on this benchmark is
+unstable across splits precisely because the signal is not strong enough for
+reconstruction-based detection.
+
+---

@@ -166,9 +166,19 @@ def inject_synthetic_anomalies(
 
 
 def evaluate_injection_recovery(model, X_injected: np.ndarray, y_true: np.ndarray) -> Dict:
-    """Precision@k, recall@k, ROC-AUC, AP using model anomaly scores."""
+    """Precision@k, Recall@k, ROC-AUC, and Average Precision using model anomaly scores.
+
+    k is set to n_synthetic (the number of injected anomalies), so Recall@k answers
+    "of the injected anomalies, what fraction appear in the model's top-k predictions?"
+    This is a proportional recall, not a fixed-cutoff recall.  Always read k alongside
+    n_synthetic (stored in the returned dict) — e.g. "Recall@50" for 50 injected points.
+
+    Average Precision (AP) is the primary ranking metric and is robust to the choice
+    of k; it is reported alongside Recall@k for completeness.
+    """
     scores = model.score(X_injected)
-    k = int(y_true.sum())
+    n_synthetic = int(y_true.sum())
+    k = n_synthetic  # k == n_synthetic: Recall@k is proportional, not a fixed cutoff
     top_k_idx = np.argsort(scores)[::-1][:k]
     y_pred_topk = np.zeros(len(y_true), dtype=int)
     y_pred_topk[top_k_idx] = 1
@@ -180,16 +190,17 @@ def evaluate_injection_recovery(model, X_injected: np.ndarray, y_true: np.ndarra
         "recall_at_k": float(recall_score(y_true, y_pred_topk, zero_division=0)),
         "roc_auc": float(roc_auc_score(y_true, scores_norm)),
         "average_precision": float(average_precision_score(y_true, scores_norm)),
-        "n_synthetic": int(y_true.sum()),
+        "n_synthetic": n_synthetic,
+        "k_used": k,  # always equals n_synthetic; stored so CSV is self-documenting
         "n_recovered_in_top_k": int(y_pred_topk[y_true == 1].sum()),
     }
     logger.info(
-        "Injection recovery — P@%s: %.3f R@%s: %.3f ROC-AUC: %.3f",
+        "Injection recovery (k=n_synthetic=%s) — P@k: %.3f  R@k: %.3f  ROC-AUC: %.3f  AP: %.3f",
         k,
         results["precision_at_k"],
-        k,
         results["recall_at_k"],
         results["roc_auc"],
+        results["average_precision"],
     )
     return results
 

@@ -18,6 +18,79 @@ from src.config import MIN_EVAL_COVERAGE, RATING_BANDS, RATING_BAND_LABELS
 
 logger = logging.getLogger(__name__)
 
+# Raw-feature → band-z-score column pairs.  Used in add_engineered_features and
+# re-exported so pipeline.py can propagate corrected values back into X_arr after
+# computing band stats from training players only (fixes band-z leakage).
+BAND_Z_PAIRS: list[tuple[str, str]] = [
+    ("avg_acpl",            "avg_acpl_band_z"),
+    ("best_move_rate",      "best_move_rate_band_z"),
+    ("avg_acpl_opening",    "avg_acpl_opening_band_z"),
+    ("avg_acpl_middlegame", "avg_acpl_middlegame_band_z"),
+    ("avg_acpl_endgame",    "avg_acpl_endgame_band_z"),
+    ("acpl_consistency",    "acpl_consistency_band_z"),
+    ("avg_weighted_acpl",   "avg_weighted_acpl_band_z"),
+    ("acpl_phase_gap",      "acpl_phase_gap_band_z"),
+]
+
+
+def compute_band_stats(
+    df: pd.DataFrame,
+) -> dict[str, dict[str, tuple[float, float]]]:
+    """Return within-band (mean, std) for each raw feature in BAND_Z_PAIRS.
+
+    Pass a training-only subset of the player DataFrame so the stats are never
+    contaminated by validation or test players.
+
+    Returns:
+        {raw_feat: {band_label: (mean, std)}}
+        Missing bands (< 2 players) are omitted; the caller should treat them as
+        (0.0, 1.0) or leave the z-score as NaN.
+    """
+    stats: dict[str, dict[str, tuple[float, float]]] = {}
+    if "rating_band" not in df.columns:
+        return stats
+    for raw_feat, _ in BAND_Z_PAIRS:
+        if raw_feat not in df.columns:
+            continue
+        band_map: dict[str, tuple[float, float]] = {}
+        for band in df["rating_band"].dropna().unique():
+            col = df.loc[df["rating_band"] == band, raw_feat].dropna()
+            if len(col) < 2:
+                continue
+            band_map[str(band)] = (float(col.mean()), float(col.std()))
+        if band_map:
+            stats[raw_feat] = band_map
+    return stats
+
+
+def reapply_band_zscores(
+    df: pd.DataFrame,
+    band_stats: dict[str, dict[str, tuple[float, float]]],
+) -> pd.DataFrame:
+    """Overwrite *_band_z columns in df using pre-computed (mean, std) dicts.
+
+    Works for any subset of df (train, val, test, full population).  Rows
+    whose band has no entry in band_stats keep their existing value (or NaN
+    if the column didn't exist yet).
+    """
+    df = df.copy()
+    if "rating_band" not in df.columns:
+        return df
+    for raw_feat, z_feat in BAND_Z_PAIRS:
+        if raw_feat not in df.columns or raw_feat not in band_stats:
+            continue
+        df[z_feat] = np.nan
+        for band, (mean, std) in band_stats[raw_feat].items():
+            mask = df["rating_band"].astype(str) == str(band)
+            if not mask.any():
+                continue
+            if std > 0:
+                df.loc[mask, z_feat] = (df.loc[mask, raw_feat] - mean) / std
+            else:
+                df.loc[mask, z_feat] = 0.0
+        logger.info("Band z-score '%s' reapplied for %s players", z_feat, df[z_feat].notna().sum())
+    return df
+
 
 def aggregate_player_stats(player_df: pd.DataFrame) -> pd.DataFrame:
     """Aggregate per-game player records into one row per player.
@@ -298,47 +371,11 @@ def add_engineered_features(agg: pd.DataFrame) -> pd.DataFrame:
     #
     # We keep the raw columns intact and add new *_band_z columns.
     # The raw values are still in player_features.csv for reporting and explainability.
-    # Band z-scores are computed on the full population (all 28k players), which is fine
-    # here — these are "contextual" statistics (what's normal for a 1400-rated player?)
-    # rather than learned model parameters, so using all data doesn't cause leakage.
-    for raw_feat, z_feat in [
-        ("avg_acpl",            "avg_acpl_band_z"),
-        ("best_move_rate",      "best_move_rate_band_z"),
-        # Per-phase ACPL — each phase compared within rating band.
-        # Middlegame is the key signal: engines get turned on when positions get complex.
-        # Opening is less informative (cheaters often play theory normally).
-        # Endgame is informative but many games end before move 30, so coverage is lower.
-        ("avg_acpl_opening",    "avg_acpl_opening_band_z"),
-        ("avg_acpl_middlegame", "avg_acpl_middlegame_band_z"),
-        ("avg_acpl_endgame",    "avg_acpl_endgame_band_z"),
-        # ACPL consistency — also band-normalized.
-        # The user's insight: higher-rated players are naturally more consistent
-        # (lower STDCPL) because their skill floor is higher. A 2200 player
-        # fluctuates between ACPL 20-35; a 1200 might fluctuate 50-120. Without
-        # band normalization we'd flag high-rated players as suspicious just for
-        # being good, which is wrong. Comparing within band makes the signal fair.
-        ("acpl_consistency",    "acpl_consistency_band_z"),
-        # Complexity-weighted ACPL — same band-normalization rationale as raw ACPL:
-        # higher-rated players naturally have lower weighted ACPL regardless of cheating,
-        # so comparing within band keeps the signal fair.
-        ("avg_weighted_acpl",   "avg_weighted_acpl_band_z"),
-    ]:
-        if raw_feat in df.columns and "rating_band" in df.columns:
-            df[z_feat] = np.nan
-            for band in df["rating_band"].dropna().unique():
-                mask = df["rating_band"] == band
-                col = df.loc[mask, raw_feat].dropna()
-                if len(col) < 2:
-                    continue
-                mean, std = float(col.mean()), float(col.std())
-                if std > 0:
-                    df.loc[mask, z_feat] = (df.loc[mask, raw_feat] - mean) / std
-                else:
-                    df.loc[mask, z_feat] = 0.0
-            n_computed = df[z_feat].notna().sum()
-            logger.info(
-                "Within-band z-score '%s' computed for %s players", z_feat, n_computed
-            )
+    #
+    # NOTE: this call computes band stats from the full df passed in.  In the
+    # pipeline, add_engineered_features is followed by a train/val/test split and
+    # then Stage 2e, which recomputes these columns using training-player stats only
+    # (see pipeline.py).  The values written here are intentionally overwritten there.
 
     # ── Phase gap: opening ACPL minus middlegame ACPL ─────────────────────────
     # This is the single most powerful phase-based signal. A player who plays
@@ -356,25 +393,9 @@ def add_engineered_features(agg: pd.DataFrame) -> pd.DataFrame:
         df["acpl_phase_gap"] = (
             df["avg_acpl_opening"] - df["avg_acpl_middlegame"]
         )
-        # Band-normalize the gap
-        if "rating_band" in df.columns:
-            df["acpl_phase_gap_band_z"] = np.nan
-            for band in df["rating_band"].dropna().unique():
-                mask = df["rating_band"] == band
-                col = df.loc[mask, "acpl_phase_gap"].dropna()
-                if len(col) < 2:
-                    continue
-                mean, std = float(col.mean()), float(col.std())
-                if std > 0:
-                    df.loc[mask, "acpl_phase_gap_band_z"] = (
-                        df.loc[mask, "acpl_phase_gap"] - mean
-                    ) / std
-                else:
-                    df.loc[mask, "acpl_phase_gap_band_z"] = 0.0
-            logger.info(
-                "Phase gap feature 'acpl_phase_gap_band_z' computed for %s players",
-                df["acpl_phase_gap_band_z"].notna().sum(),
-            )
+
+    _band_stats = compute_band_stats(df)
+    df = reapply_band_zscores(df, _band_stats)
 
     logger.info("Engineered features added. Shape: %s", df.shape)
     return df

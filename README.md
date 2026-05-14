@@ -6,7 +6,7 @@ Status: Approved by Prof. Matteo Turilli
 
 Group repository: [github.com/Kiril-P/Final-Group-Project-Machine-Learning](https://github.com/Kiril-P/Final-Group-Project-Machine-Learning)
 
-This project detects unusual player behavior patterns in online chess games using unsupervised anomaly detection. The workflow starts from game-level Lichess data, reshapes it into player-level records, engineers behavioral features, and then compares multiple detectors (Isolation Forest, One-Class SVM, Local Outlier Factor, and an autoencoder) against synthetic anomaly injections. The objective is to identify statistically unusual behavior clusters for analysis, not to assign definitive cheating labels.
+This project detects unusual player behavior patterns in online chess games using unsupervised anomaly detection. The workflow starts from game-level Lichess data, reshapes it into player-level records, engineers behavioral features, and then compares multiple detectors (Isolation Forest, One-Class SVM, Local Outlier Factor, a standard Autoencoder, and a focused ACPL sub-autoencoder) against synthetic anomaly injections. The objective is to identify statistically unusual behavior clusters for analysis, not to assign definitive cheating labels.
 
 ## What The Pipeline Does
 
@@ -14,11 +14,12 @@ Running the full pipeline with `python -m src.pipeline` executes these stages:
 
 1. Load and clean raw game data from `data/raw/games.csv`.
 2. Build player-level aggregates and engineered features.
-3. Split data into train/validation/test (70/15/15) and fit scaling on train only.
-4. Tune model hyperparameters on injected validation anomalies.
-5. Run 5-fold cross-validation on the development split.
-6. Train all models and evaluate on validation and holdout test injections.
-7. Export metrics, feature importance, and failure analysis outputs.
+3. Split data into train/validation/test (70/15/15).
+4. **Stage 2e** — recompute within-band z-scores (ACPL features) using training players only, then refit `StandardScaler` on train. This eliminates the band-normalisation data leakage that would otherwise let val/test distribution statistics influence training-set normalisation.
+5. Tune model hyperparameters on injected validation anomalies.
+6. Run 5-fold cross-validation on the development split.
+7. Train all models (Isolation Forest, OC-SVM, LOF, Autoencoder, ACPLSubAutoencoder) and evaluate on validation and holdout test injections.
+8. Export metrics, feature importance, and failure analysis outputs.
 
 Main outputs are written to `results/` (metrics and analysis tables) and `models/` (saved fitted models).
 
@@ -196,4 +197,5 @@ python -m jupyter lab notebooks/01_eda.ipynb
 | Notebook | Purpose |
 |----------|---------|
 | `notebooks/01_eda.ipynb` | Data inspection, quality checks, distributions |
-| `notebooks/03_modeling.ipynb` | Model comparison and anomaly detection analysis |
+| `notebooks/02_preprocessing.ipynb` | Preprocessing decisions, feature engineering, Stage 2e band z-score leakage fix |
+| `notebooks/03_modeling.ipynb` | Model comparison, ACPLSubAutoencoder diagnostic, injection recovery across all three strategies |

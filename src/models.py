@@ -25,6 +25,7 @@ from sklearn.svm import OneClassSVM
 from torch.utils.data import DataLoader, TensorDataset
 
 from src.config import (
+    ACPL_SUB_FEATURES,
     AUTOENCODER_EVAL_FEATURES,
     AUTOENCODER_EVAL_WEIGHT,
     AUTOENCODER_PARAMS,
@@ -260,6 +261,11 @@ class AutoencoderDetector:
         self.batch_size = params["batch_size"]
         self.lr = params["learning_rate"]
         self.threshold_pct = params["reconstruction_threshold_percentile"]
+        # Top-k mean scoring: average only the k worst-reconstructed features rather
+        # than all features. Prevents large ACPL errors from being diluted by the
+        # many near-zero behavioural feature errors that sophisticated cheaters
+        # deliberately maintain. Set to 0 to fall back to plain mean.
+        self.scoring_top_k: int = int(params.get("scoring_top_k", 0))
         self.input_dim = input_dim
         self.feature_names = feature_names            # used to build per-feature weight vector
         self._weight_vector: Optional[torch.Tensor] = None  # built in _build()
@@ -322,7 +328,14 @@ class AutoencoderDetector:
             sq_err = (recon - tensor) ** 2
             if self._weight_vector is not None:
                 sq_err = sq_err * self._weight_vector
-            errors = sq_err.mean(dim=1).cpu().numpy()
+            k = self.scoring_top_k
+            if k and 0 < k < sq_err.shape[1]:
+                # Average the k largest per-feature errors instead of all features.
+                # After weighting, ACPL features (3×) naturally surface in the top-k,
+                # so this is guaranteed to pick up chess-accuracy deviations first.
+                errors = sq_err.topk(k, dim=1).values.mean(dim=1).cpu().numpy()
+            else:
+                errors = sq_err.mean(dim=1).cpu().numpy()
         return errors
 
     def score(self, X: np.ndarray) -> np.ndarray:
@@ -368,6 +381,104 @@ class AutoencoderDetector:
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.threshold_ = checkpoint["threshold"]
         return self
+
+
+class ACPLSubAutoencoder:
+    """Autoencoder trained exclusively on chess-accuracy (ACPL) features.
+
+    Motivation — the dilution problem:
+        The standard Autoencoder computes anomaly score as a mean reconstruction
+        error across all 14 features.  A sophisticated cheater keeps 5-7
+        behavioural features (game length, opening variety, win rate) exactly at
+        the population mean while their ACPL features are subtly anomalous.
+        Those near-zero behavioural errors dominate the mean and wash out the
+        ACPL signal.
+
+        This model avoids dilution by operating only in the 9-dimensional chess-
+        accuracy sub-space (ACPL variants, blunder rate, best-move rate).
+        Outcome-based features (comeback_rate, performance_vs_actual,
+        underdog_win_rate) are deliberately excluded: they reflect Elo performance,
+        not move quality, and a legitimately improving player can show the same
+        patterns as an engine user in those dimensions.
+
+    Fallback:
+        If the feature matrix contains no ACPL features (e.g. small Kaggle
+        dataset with base feature set), the model falls back silently to training
+        on all available features — same as the standard AE.
+
+    Ensemble membership:
+        This model is tracked alongside the main ensemble but does NOT vote in
+        ensemble_flag / ensemble_confident.  It serves as a targeted diagnostic
+        complementing the three ensemble voters (LOF, AE, OC-SVM), each of which
+        already brings a geometrically distinct perspective on the full feature
+        space.  Adding a fourth voter specialised on a feature sub-set would shift
+        the ensemble toward ACPL-driven detections and reduce the diversity that
+        gives the 2/3 majority vote its robustness.
+    """
+
+    name = "ACPLSubAutoencoder"
+
+    def __init__(
+        self,
+        feature_names: Optional[list] = None,
+        contamination: float = 0.05,
+        epochs: int = 100,
+        **kwargs,
+    ):
+        self.feature_names = feature_names or []
+        self.contamination = contamination
+        self.epochs = epochs
+        self._acpl_indices: list = []
+        self._ae: Optional[AutoencoderDetector] = None
+        self.threshold_: Optional[float] = None
+
+    def _resolve_indices(self) -> list:
+        return [i for i, f in enumerate(self.feature_names) if f in ACPL_SUB_FEATURES]
+
+    def _slice(self, X: np.ndarray) -> np.ndarray:
+        if self._acpl_indices:
+            return X[:, self._acpl_indices]
+        return X
+
+    def fit(self, X: np.ndarray) -> "ACPLSubAutoencoder":
+        self._acpl_indices = self._resolve_indices()
+        X_sub = self._slice(X)
+        n_feats = X_sub.shape[1]
+
+        if not self._acpl_indices:
+            logger.warning(
+                "ACPLSubAutoencoder: no ACPL features found — falling back to all %d features.",
+                n_feats,
+            )
+        else:
+            acpl_feat_names = [self.feature_names[i] for i in self._acpl_indices]
+            logger.info(
+                "ACPLSubAutoencoder: training on %d accuracy features: %s",
+                n_feats, acpl_feat_names,
+            )
+
+        enc_dim = max(2, n_feats // 2)
+        threshold_pct = int(round(100 * (1 - self.contamination)))
+        self._ae = AutoencoderDetector(
+            input_dim=n_feats,
+            encoding_dim=enc_dim,
+            epochs=self.epochs,
+            batch_size=64,
+            learning_rate=1e-3,
+            reconstruction_threshold_percentile=threshold_pct,
+            scoring_top_k=0,   # sub-model already focuses on accuracy features; no further top-k needed
+        )
+        self._ae.fit(X_sub)
+        self.threshold_ = self._ae.threshold_
+        return self
+
+    def score(self, X: np.ndarray) -> np.ndarray:
+        assert self._ae is not None, "Call fit() before score()"
+        return self._ae.score(self._slice(X))
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        assert self.threshold_ is not None
+        return np.where(self.score(X) > self.threshold_, -1, 1)
 
 
 def tune_contamination(
@@ -590,6 +701,7 @@ def run_all_models(
             **params.get("Autoencoder", {}),
         ),
         HDBSCANDetector(**params.get("HDBSCAN", HDBSCAN_PARAMS)),
+        ACPLSubAutoencoder(**params.get("ACPLSubAutoencoder", {})),
     ]
 
     for m in model_list:

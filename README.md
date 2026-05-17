@@ -1,10 +1,26 @@
 # Unmasking the Board: Behavioral Anomaly Detection in Human Chess
 
-BCSAI - Machine Learning Foundations | Group project
+BCSAI - Machine Learning Foundations | Group project | IE University 2026
+
+**Team:** Christoph, Kiril, Ali, Georgy
 
 Status: Approved by Prof. Matteo Turilli
 
 Group repository: [github.com/Kiril-P/Final-Group-Project-Machine-Learning](https://github.com/Kiril-P/Final-Group-Project-Machine-Learning)
+
+---
+
+## Deliverables
+
+| Deliverable | File |
+|---|---|
+| 📄 Report (PDF) | [`deliverables/report.pdf`](deliverables/report.pdf) |
+| 🖼️ Poster (A1 PDF) | [`deliverables/poster.pdf`](deliverables/poster.pdf) |
+| 📊 Presentation (PPTX) | [`deliverables/presentation.pptx`](deliverables/presentation.pptx) |
+| 💻 Pipeline entry point | `python -m src.pipeline` (see Setup below) |
+| 📓 Notebooks | `notebooks/01_eda.ipynb`, `02_preprocessing.ipynb`, `03_modeling.ipynb` |
+
+---
 
 This project detects unusual player behavior patterns in online chess games using unsupervised anomaly detection. The workflow starts from game-level Lichess data, reshapes it into player-level records, engineers behavioral features, and then compares multiple detectors (Isolation Forest, One-Class SVM, Local Outlier Factor, a standard Autoencoder, and a focused ACPL sub-autoencoder) against synthetic anomaly injections. The objective is to identify statistically unusual behavior clusters for analysis, not to assign definitive cheating labels.
 
@@ -174,6 +190,10 @@ python -m jupyter lab notebooks/01_eda.ipynb
 ## Project Layout
 
 ~~~text
+├── deliverables/
+│   ├── report.pdf        # Project report
+│   ├── poster.pdf        # A1 poster (landscape)
+│   └── presentation.pptx # 10-slide presentation
 ├── data/
 │   ├── raw/              # games.csv (not committed)
 │   └── processed/        # optional intermediate artifacts

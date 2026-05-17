@@ -17,204 +17,163 @@ Group repository: [github.com/Kiril-P/Final-Group-Project-Machine-Learning](http
 | 📄 Report (PDF) | [`deliverables/report.pdf`](deliverables/report.pdf) |
 | 🖼️ Poster (A1 PDF) | [`deliverables/poster.pdf`](deliverables/poster.pdf) |
 | 📊 Presentation (PPTX) | [`deliverables/presentation.pptx`](deliverables/presentation.pptx) |
-| 💻 Pipeline entry point | `python -m src.pipeline` (see Setup below) |
+| 📊 Pre-computed results | [`results/`](results/) — all charts, CSVs, and metrics |
 | 📓 Notebooks | `notebooks/01_eda.ipynb`, `02_preprocessing.ipynb`, `03_modeling.ipynb` |
 
 ---
 
-This project detects unusual player behavior patterns in online chess games using unsupervised anomaly detection. The workflow starts from game-level Lichess data, reshapes it into player-level records, engineers behavioral features, and then compares multiple detectors (Isolation Forest, One-Class SVM, Local Outlier Factor, a standard Autoencoder, and a focused ACPL sub-autoencoder) against synthetic anomaly injections. The objective is to identify statistically unusual behavior clusters for analysis, not to assign definitive cheating labels.
+## Project Summary
 
-## What The Pipeline Does
+This project detects unusual player behavior patterns in online chess games using unsupervised anomaly detection. Game-level Lichess data is reshaped into player-level records, 21 behavioral and engine-accuracy features are engineered, and six detectors (Z-Score baseline, LOF, Isolation Forest, One-Class SVM, Autoencoder, ACPLSubAutoencoder) are compared against synthetic anomaly injections. An ensemble (LOF + Autoencoder + OC-SVM, majority vote ≥ 2/3) flags players for human review. The objective is to identify statistically unusual behavior clusters, not to assign definitive cheating labels.
 
-Running the full pipeline with `python -m src.pipeline` executes these stages:
+**Key result:** LOF achieves CV ROC-AUC = 0.959 ± 0.030 and test AUC = 0.971 on subtle synthetic injection. 312 of 17,909 players (1.7%) were flagged by the ensemble.
 
-1. Load and clean raw game data from `data/raw/games.csv`.
-2. Build player-level aggregates and engineered features.
-3. Split data into train/validation/test (70/15/15).
-4. **Stage 2e** — recompute within-band z-scores (ACPL features) using training players only, then refit `StandardScaler` on train. This eliminates the band-normalisation data leakage that would otherwise let val/test distribution statistics influence training-set normalisation.
-5. Tune model hyperparameters on injected validation anomalies.
-6. Run 5-fold cross-validation on the development split.
-7. Train all models (Isolation Forest, OC-SVM, LOF, Autoencoder, ACPLSubAutoencoder) and evaluate on validation and holdout test injections.
-8. Export metrics, feature importance, and failure analysis outputs.
+---
 
-Main outputs are written to `results/` (metrics and analysis tables) and `models/` (saved fitted models).
+## What Can Be Run
 
-## Prerequisites
+### ✅ 1. Verify the code works — run tests (no dataset needed, ~10 seconds)
 
-- Python 3.10+ (3.12 recommended).
+```bash
+python -m pytest
+```
 
-## Setup And Run
+Expected output: `8 passed`. This verifies all feature engineering, splitting, and validation logic without requiring any data download.
 
-Use one of the two workflows below.
+### ✅ 2. Verify the small dataset loads (Kaggle mirror, already in repo)
 
-### macOS/Linux
+```bash
+python -c "from src.data_loader import load_raw; print(load_raw().shape)"
+```
 
-1. Go to the project root.
+Expected output: `(20058, 16)`. The small Kaggle mirror (`data/raw/games.csv`) is included and loads automatically.
 
-~~~bash
-cd "/path/to/Final-Group-Project-Machine-Learning"
-~~~
+### ✅ 3. View pre-computed results (no setup needed)
 
-2. Create the environment, install dependencies, and attempt dataset download.
+All pipeline outputs from the full Lichess run are committed to [`results/`](results/):
 
-~~~bash
-bash scripts/setup.sh
-~~~
+| File | Contents |
+|---|---|
+| `results/all_player_results.csv` | Anomaly scores + ensemble flags for all 17,909 players |
+| `results/cv_summary.csv` | 5-fold CV ROC-AUC mean ± std per model |
+| `results/holdout_evaluation.csv` | Test-set metrics (AUC, AP, Recall@k) per model |
+| `results/feature_importance.png` | Permutation importance chart |
+| `results/umap_overview.png` | UMAP projection of all players |
+| `results/roc_curves_subtle.png` | ROC curves (subtle injection, test set) |
+| `results/model_agreement_matrix.png` | Model agreement matrix |
+| `results/learning_curves.png` | LOF data-efficiency curve |
 
-3. Activate the environment.
+### ✅ 4. Run the notebooks (methodology walkthrough on small dataset, ~5 minutes)
 
-~~~bash
+> **Note:** The notebooks run on the small Kaggle dataset (20,058 games, 299 players, 8 features) to demonstrate methodology interactively. The numbers they produce (e.g. LOF AUC ≈ 0.74) differ from the report because the report uses the full Lichess dataset. Pre-computed results from the full run are loaded automatically in Section 12 of notebook 03.
+
+```bash
+jupyter lab notebooks/01_eda.ipynb
+```
+
+### ⏱️ 5. Reproduce the full pipeline (requires Lichess dataset — hours)
+
+The results in `results/` were produced by running the full pipeline on the Lichess July 2016 dataset (6.25M games). To reproduce exactly:
+
+**Step 1 — Download the dataset from Kaggle:**
+
+```bash
+# Option A: Kaggle CLI (requires ~/.kaggle/kaggle.json credentials)
+kaggle datasets download -d arevel/chess-games
+unzip chess-games.zip -d data/raw/
+
+# Option B: Manual — go to https://www.kaggle.com/datasets/arevel/chess-games
+# Download the CSV and place it at: data/raw/lichess_jul2016.csv
+```
+
+**Step 2 — Verify the file is in the right place:**
+
+```bash
+python -c "import pandas as pd; df = pd.read_csv('data/raw/lichess_jul2016.csv', nrows=5); print(df.shape[1], 'columns found')"
+```
+
+**Step 3 — Run the pipeline:**
+
+```bash
+python -m src.pipeline
+```
+
+This takes several hours on a standard laptop and writes all outputs to `results/`. All outputs are already committed to `results/` so this step is optional — the pre-computed results are ready to use immediately.
+
+---
+
+## Setup
+
+### Prerequisites
+
+- Python 3.10+ (3.12 recommended)
+- **Windows only:** JupyterLab requires Long Path support. Run once in PowerShell as Administrator:
+
+```powershell
+Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1
+```
+
+Then restart your terminal. Alternatively, clone to a short path like `C:\ML\`. Tests and the pipeline core are not affected by this limit.
+
+### Install dependencies
+
+**macOS/Linux:**
+```bash
+python -m venv .venv
 source .venv/bin/activate
-~~~
+pip install -r requirements.txt
+```
 
-4. Run tests.
-
-~~~bash
-python -m pytest
-~~~
-
-5. Verify the dataset is readable.
-
-~~~bash
-python -c "from src.data_loader import load_raw; print(load_raw().shape)"
-~~~
-
-6. Run the full pipeline.
-
-~~~bash
-python -m src.pipeline
-~~~
-
-### Windows (PowerShell)
-
-1. Go to the project root.
-
-~~~powershell
-cd "C:\path\to\Final-Group-Project-Machine-Learning"
-~~~
-
-2. Create the environment, install dependencies, and attempt dataset download.
-
-~~~powershell
-powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
-~~~
-
-3. Activate the environment.
-
-~~~powershell
+**Windows (PowerShell):**
+```powershell
+python -m venv .venv
 & .\.venv\Scripts\Activate.ps1
-~~~
+pip install -r requirements.txt
+```
 
-4. Run tests.
+**Conda (any platform):**
+```bash
+conda env create -f environment.yml
+conda activate chess-anomaly
+```
 
-~~~powershell
-python -m pytest
-~~~
-
-5. Verify the dataset is readable.
-
-~~~powershell
-python -c "from src.data_loader import load_raw; print(load_raw().shape)"
-~~~
-
-6. Run the full pipeline.
-
-~~~powershell
-python -m src.pipeline
-~~~
-
-## Dataset
-
-The pipeline uses the **Lichess July 2016 game database** (6.25M games, sampled to 500k, yielding 17,909 unique players after filtering).
-
-Dataset source: [Lichess Open Database — July 2016](https://database.lichess.org/) (`lichess_db_standard_rated_2016-07.pgn.bz2`)
-
-After downloading and converting to CSV, place the file as `data/raw/games.csv`, then verify with:
-
-The setup scripts above also call `scripts/download_kaggle_dataset.py` as a fallback for the small Kaggle mirror, but the full results in this repository were produced on the Lichess dataset above.
-
-If the dataset file is not present, manually place `games.csv` in `data/raw/`, then rerun:
-
-~~~bash
-python -c "from src.data_loader import load_raw; print(load_raw().shape)"
-~~~
-
-## Daily Use (After First Setup)
-
-Use this when `.venv` and dependencies are already installed.
-
-### macOS/Linux
-
-1. Go to the project root and activate the environment.
-
-~~~bash
-cd "/path/to/Final-Group-Project-Machine-Learning"
-source .venv/bin/activate
-~~~
-
-2. Run the pipeline.
-
-~~~bash
-python -m src.pipeline
-~~~
-
-3. Optional checks.
-
-~~~bash
-python -m pytest
-python -m jupyter lab notebooks/01_eda.ipynb
-~~~
-
-### Windows (PowerShell)
-
-1. Go to the project root and activate the environment.
-
-~~~powershell
-cd "C:\path\to\Final-Group-Project-Machine-Learning"
-& .\.venv\Scripts\Activate.ps1
-~~~
-
-2. Run the pipeline.
-
-~~~powershell
-python -m src.pipeline
-~~~
-
-3. Optional checks.
-
-~~~powershell
-python -m pytest
-python -m jupyter lab notebooks/01_eda.ipynb
-~~~
+---
 
 ## Project Layout
 
-~~~text
+```
 ├── deliverables/
-│   ├── report.pdf        # Project report
-│   ├── poster.pdf        # A1 poster (landscape)
-│   └── presentation.pptx # 10-slide presentation
+│   ├── report.pdf            # Project report
+│   ├── poster.pdf            # A1 poster (landscape)
+│   └── presentation.pptx     # 10-slide presentation
 ├── data/
-│   ├── raw/              # games.csv (not committed)
-│   └── processed/        # optional intermediate artifacts
-├── docs/
-├── models/               # saved model files (.pkl, .pt) — generated on first pipeline run, gitignored
-├── notebooks/            # EDA and modeling notebooks
-├── results/              # pipeline outputs, metrics, analysis tables
-├── scripts/              # setup and dataset bootstrap scripts
-├── src/                  # project code (loading, features, models, validation)
+│   ├── raw/games.csv         # Small Kaggle mirror (committed); replace with Lichess for full run
+│   └── processed/            # Optional intermediate artifacts
+├── docs/                     # Professor feedback, decisions log
+├── decisions.md              # Methodological decision log (all major choices documented)
+├── results/                  # ← Pre-computed pipeline outputs (charts, CSVs, metrics)
+├── models/                   # Saved model files — generated on pipeline run, gitignored
+├── notebooks/
+│   ├── 01_eda.ipynb          # Exploratory data analysis
+│   ├── 02_preprocessing.ipynb# Feature engineering and leakage fix (Stage 2e)
+│   └── 03_modeling.ipynb     # Model training, evaluation, injection recovery
+├── src/
+│   ├── config.py             # Feature definitions, hyperparameter search spaces
+│   ├── data_loader.py        # Raw data loading and cleaning
+│   ├── lichess_loader.py     # Lichess PGN parser and player aggregation
+│   ├── features.py           # Feature engineering and train/val/test split
+│   ├── models.py             # All six detectors + ensemble
+│   ├── validation.py         # Synthetic injection, CV, metrics
+│   ├── interpretation.py     # Permutation importance, UMAP, SHAP, failure analysis
+│   └── pipeline.py           # End-to-end orchestration
 ├── tests/
-├── Makefile
-├── environment.yml
-├── requirements.txt
-├── pytest.ini
-└── README.md
-~~~
-
-## Notebooks
-
-| Notebook | Purpose |
-|----------|---------|
-| `notebooks/01_eda.ipynb` | Data inspection, quality checks, distributions |
-| `notebooks/02_preprocessing.ipynb` | Preprocessing decisions, feature engineering, Stage 2e band z-score leakage fix |
-| `notebooks/03_modeling.ipynb` | Model comparison, ACPLSubAutoencoder diagnostic, injection recovery across all three strategies |
+│   └── test_features.py      # 8 unit tests (run with: python -m pytest)
+├── scripts/
+│   ├── setup.sh              # One-shot setup (macOS/Linux)
+│   ├── setup.ps1             # One-shot setup (Windows)
+│   └── download_kaggle_dataset.py
+├── Makefile                  # make test / make pipeline / make lab
+├── environment.yml           # Conda environment
+├── requirements.txt          # pip dependencies
+└── decisions.md              # Full methodological decision log
+```

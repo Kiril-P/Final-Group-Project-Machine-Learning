@@ -16,6 +16,7 @@ python-chess>=1.999
 
 # Interpretability
 shap>=0.43
+umap-learn>=0.5
 
 # Jupyter
 jupyter>=1.0

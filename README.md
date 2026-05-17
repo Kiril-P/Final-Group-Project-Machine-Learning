@@ -109,16 +109,15 @@ python -m src.pipeline
 
 ## Dataset
 
-The setup scripts above already call `scripts/download_kaggle_dataset.py`.
+The pipeline uses the **Lichess July 2016 game database** (6.25M games, sampled to 500k, yielding 17,909 unique players after filtering).
 
-- If Kaggle CLI and credentials are configured, `data/raw/games.csv` is downloaded automatically.
-- If Kaggle is not configured, the script prints a skip message and setup still completes.
+Dataset source: [Lichess Open Database — July 2016](https://database.lichess.org/) (`lichess_db_standard_rated_2016-07.pgn.bz2`)
 
-Dataset source website: [Kaggle - Chess Game Dataset (Lichess)](https://www.kaggle.com/datasets/datasnaek/chess)
+After downloading and converting to CSV, place the file as `data/raw/games.csv`, then verify with:
 
-Kaggle API credentials page: [Kaggle Settings](https://www.kaggle.com/settings)
+The setup scripts above also call `scripts/download_kaggle_dataset.py` as a fallback for the small Kaggle mirror, but the full results in this repository were produced on the Lichess dataset above.
 
-If download is skipped, manually place `games.csv` in `data/raw/`, then rerun:
+If the dataset file is not present, manually place `games.csv` in `data/raw/`, then rerun:
 
 ~~~bash
 python -c "from src.data_loader import load_raw; print(load_raw().shape)"
@@ -179,7 +178,7 @@ python -m jupyter lab notebooks/01_eda.ipynb
 │   ├── raw/              # games.csv (not committed)
 │   └── processed/        # optional intermediate artifacts
 ├── docs/
-├── models/               # saved model files (.pkl, .pt)
+├── models/               # saved model files (.pkl, .pt) — generated on first pipeline run, gitignored
 ├── notebooks/            # EDA and modeling notebooks
 ├── results/              # pipeline outputs, metrics, analysis tables
 ├── scripts/              # setup and dataset bootstrap scripts

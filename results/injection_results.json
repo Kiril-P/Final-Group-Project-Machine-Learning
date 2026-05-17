@@ -1,0 +1,9 @@
+{
+  "precision_at_k": 0.04,
+  "recall_at_k": 0.04,
+  "roc_auc": 0.7202828433196873,
+  "average_precision": 0.04618125014771544,
+  "n_synthetic": 50,
+  "k_used": 50,
+  "n_recovered_in_top_k": 2
+}

@@ -25,6 +25,7 @@ htmlcov/
 data/raw/*.csv
 data/processed/*
 !data/raw/.gitkeep
+!data/raw/games.csv
 !data/processed/.gitkeep
 
 # Artifacts
@@ -32,6 +33,9 @@ models/*
 !models/.gitkeep
 results/*
 !results/.gitkeep
+!results/*.csv
+!results/*.png
+!results/*.json
 *.pkl
 *.pt
 

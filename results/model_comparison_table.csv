@@ -1,0 +1,7 @@
+Model,ROC-AUC,Avg Precision,Precision@k,Recall@k,Silhouette↑,Davies-Bouldin↓
+ZScoreBaseline,0.704,0.748,0.68,0.68,0.364,3.834
+LOF,0.739,0.77,0.7,0.7,0.218,6.3
+IsolationForest,0.641,0.664,0.62,0.62,0.441,4.071
+OneClassSVM,0.78,0.815,0.72,0.72,0.211,8.922
+Autoencoder,0.713,0.745,0.68,0.68,0.278,3.918
+ACPLSubAutoencoder,0.713,0.745,0.68,0.68,0.341,2.787
